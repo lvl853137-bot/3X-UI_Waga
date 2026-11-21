@@ -1,5 +1,7 @@
 # 🚀 WAGA · Дядя Вова VPN
 
+<img width="1024" height="339" alt="e11230b8-7ea5-47ea-b0d3-57cb4876b358" src="https://github.com/user-attachments/assets/ea4dc45b-384b-4c8d-963e-f71afce22491" />
+
 Собственная система развёртывания и управления VPN на базе **3X-UI v3.9.0 + Xray v26.6.27 + Nginx (SNI 443) + waga-sub**.
 
 ## Установка одной командой (Ubuntu 22.04/24.04, Debian 12/13)
