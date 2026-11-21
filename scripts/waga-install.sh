@@ -40,7 +40,7 @@ wait_apt_idle() {
 XUI_VERSION="v3.9.0"
 # SHA256 установщика 3X-UI закреплённой версии для контроля целостности.
 XUI_INSTALL_SHA256="18616fe26c8f6c92db6daa2dcd7cd53c5143ee69ecfd26d8ea6dc9b2c78607a6"
-WAGA_VERSION="1.0.0"
+WAGA_VERSION="1.2.0"
 # Файлы waga и waga-sub берутся из репозитория WAGA.
 WAGA_RAW="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main"
 # Ядро Xray для панели. С 26.7.x клиенты на Mihomo и sing-box (Hiddify, FlClash,
@@ -511,6 +511,23 @@ ART
   echo "${D}3X-UI + Xray + Nginx SNI + waga-sub · github.com/lvl853137-bot/3X-UI_Waga${N}"
 }
 
+
+# Автопроверка и починка DNS на свежем VPS (если сломан systemd-resolved или resolv.conf).
+ensure_dns_ok() {
+  getent ahostsv4 raw.githubusercontent.com >/dev/null 2>&1 && return 0
+  getent ahostsv4 github.com >/dev/null 2>&1 && return 0
+  warn "На сервере не работает DNS – прописываю 1.1.1.1 и 8.8.8.8"
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    mkdir -p /etc/systemd/resolved.conf.d
+    printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\nFallbackDNS=9.9.9.9\n' >/etc/systemd/resolved.conf.d/waga-dns.conf
+    systemctl restart systemd-resolved >/dev/null 2>&1 || true
+    sleep 1
+  else
+    rm -f /etc/resolv.conf 2>/dev/null || true
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >/etc/resolv.conf
+  fi
+}
+
 main() {
   local a args=()
   for a in "$@"; do
@@ -520,6 +537,7 @@ main() {
   done
   set -- ${args[@]+"${args[@]}"}
   [[ $EUID -eq 0 ]] || die "Запустите от root: sudo -i, затем команду ещё раз."
+  ensure_dns_ok
   command -v systemctl >/dev/null || die "Нужен systemd."
   # waga-sub работает без root и получает конфиг через LoadCredential: он появился в systemd 247 (Ubuntu 22.04+, Debian 11+).
   local sysv
@@ -863,7 +881,7 @@ main() {
     OPEN+=("80/tcp")
   fi
   # Одна заглушка на сервер: её показывают nginx на 443 и Hysteria2 (masquerade), её же берёт waga net masq.
-  install -d -m 755 /var/www/waga
+  install -d -m 755 /var/www/waga /etc/nginx/waga-sec.d /etc/nginx/waga-limit.d
   [[ -s /var/www/waga/index.html ]] || stub_site >/var/www/waga/index.html
   chmod 644 /var/www/waga/index.html
   # Байт в байт как у nginx: $(…) срезал бы последний перевод строки, и длина ответа Hysteria2 отличалась бы.
@@ -992,6 +1010,7 @@ main() {
     "Управление сервером: введите команду ${B}waga${N} – откроется меню. Запоминать команды не нужно."
     "Ссылки на отдельные протоколы (REALITY, Hysteria2, Telegram и другие): waga → Пользователи → Показать ссылки."
     "Добавить пользователя: waga → Пользователи → Добавить."
+    "Защита и оптимизация (Fail2ban, BBR/sysctl, 2FA, Rate-limit, DDNS, 444): waga → Защита и оптимизация сервера."
     "Резервная копия: waga → Резервная копия. Храните её как пароль.")
   tips "Что дальше" "${tp[@]}"
   if ((${#WARNINGS[@]})); then
@@ -1719,12 +1738,15 @@ server {
     # Иначе редирект «добавить слеш» уйдёт на внутренний порт nginx.
     absolute_redirect off;
     access_log off;
+    include /etc/nginx/waga-sec.d/*.conf;
 $locs
     location $SUB_PATH {
+        include /etc/nginx/waga-limit.d/*.conf;
         proxy_pass http://127.0.0.1:${INNER[sub]};
         proxy_set_header Host \$host;
     }
     location $panel_path {
+        include /etc/nginx/waga-limit.d/*.conf;
         proxy_pass https://127.0.0.1:$XUI_PANEL_PORT;
         proxy_ssl_verify off;
         proxy_http_version 1.1;
@@ -1754,6 +1776,7 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     server_tokens off;
     access_log off;
+    include /etc/nginx/waga-sec.d/*.conf;
     location / {
         root /var/www/waga;
         index index.html;
@@ -2088,7 +2111,7 @@ restore_main() { # файл
   trap "rm -rf -- '$tmp'" EXIT
   python3 - "$file" "$tmp" <<'PY' || die "Это не резервная копия WAGA · Дядя Вова VPN или она повреждена. Ничего не менял."
 import os, sys, tarfile, unicodedata
-allowed = ("etc/x-ui/x-ui.db", "etc/x-ui/install-result.env", "etc/waga/waga.env", "etc/waga-sub/config.json", "etc/waga-sub/rules.yaml", "etc/waga-sub/announce.txt", "etc/waga-sub/extra_nodes.txt",
+allowed = ("etc/x-ui/x-ui.db", "etc/x-ui/install-result.env", "etc/waga/waga.env", "etc/waga/ddns.env", "etc/waga-sub/config.json", "etc/waga-sub/rules.yaml", "etc/waga-sub/announce.txt", "etc/waga-sub/extra_nodes.txt",
            "etc/nginx/waga-stream.conf", "etc/nginx/conf.d/waga.conf", "var/www/waga", "root/cert/self",
            "root/cert/custom", "root/waga.txt", "waga-backup.env")
 parents = {"etc", "etc/x-ui", "etc/waga", "etc/waga-sub", "etc/nginx", "etc/nginx/conf.d", "var", "var/www", "root", "root/cert"}
@@ -2248,6 +2271,7 @@ PY
   [[ -f $tmp/etc/waga-sub/announce.txt ]] && install -m 644 "$tmp/etc/waga-sub/announce.txt" /etc/waga-sub/announce.txt
   [[ -f $tmp/etc/waga-sub/extra_nodes.txt ]] && install -m 644 "$tmp/etc/waga-sub/extra_nodes.txt" /etc/waga-sub/extra_nodes.txt
   [[ -f $tmp/etc/waga/waga.env ]] && install -m 600 "$tmp/etc/waga/waga.env" /etc/waga/waga.env
+  [[ -f $tmp/etc/waga/ddns.env ]] && install -m 600 "$tmp/etc/waga/ddns.env" /etc/waga/ddns.env
   [[ -f $tmp/root/waga.txt ]] && install -m 600 "$tmp/root/waga.txt" "$RESULT"
   if [[ -n $old_ip ]]; then
     say "Меняю адрес сервера в подключениях: $old_ip → $HOST"

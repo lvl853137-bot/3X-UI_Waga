@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 export LC_ALL=C.UTF-8  # ширина колонок по символам, а не байтам
 
-WAGA_VERSION="1.0.0"
+WAGA_VERSION="1.2.0"
 WAGA_RAW="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main"
 # Файлы новой версии берём из её тега, а не из меняющейся ветки main.
 waga_ref_raw() { echo "https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/v$1"; }
@@ -503,6 +503,143 @@ cmd_toggle() { # имя true|false
   [[ -n $(client "$1") ]] || die "Нет пользователя $1"
   update_user "$1" ".enable = \$v | .comment = \"waga\"" --argjson v "$2"
   if [[ $2 == true ]]; then say "Пользователь $1 включён."; else say "Пользователь $1 выключен – подписка и подключения не работают."; fi
+}
+
+
+cmd_import() { # /путь/к/old.db
+  local dbfile=${1:-}
+  [[ -n $dbfile ]] || die "Укажите путь к базе 3X-UI: waga user import /root/old-x-ui.db"
+  [[ -f $dbfile && -r $dbfile ]] || die "Файл не найден или недоступен: $dbfile"
+  command -v python3 >/dev/null || die "Нужен python3."
+  say "Импортирую только пользователей из $dbfile (настройки панели, порты и nginx не трогаю)..."
+  python3 - "$dbfile" "$XUI_ENV" <<'PY' || die "Импорт завершился с ошибкой."
+import json, re, sqlite3, ssl, sys, urllib.request
+
+old_db, env_file = sys.argv[1], sys.argv[2]
+env = {}
+for line in open(env_file, encoding="utf-8"):
+    if "=" in line:
+        k, v = line.strip().split("=", 1)
+        env[k] = v.strip("'\"")
+
+port = env["XUI_PANEL_PORT"]
+base = env["XUI_WEB_BASE_PATH"].strip("/")
+token = env["XUI_API_TOKEN"]
+ctx = ssl._create_unverified_context()
+
+def api(method, path, payload=None):
+    last_err = None
+    for scheme in ("https", "http"):
+        url = f"{scheme}://127.0.0.1:{port}/{base}/panel/api/{path}"
+        data = json.dumps(payload).encode() if payload is not None else None
+        headers = {"Authorization": f"Bearer {token}"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
+                res = json.loads(r.read().decode())
+                if not res.get("success"):
+                    raise RuntimeError(res.get("msg") or str(res))
+                return res.get("obj")
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+inbounds = api("GET", "inbounds/list")
+non_awg = [i["id"] for i in inbounds if i["protocol"] != "amneziawg"]
+awg = sorted(i["id"] for i in inbounds if i["protocol"] == "amneziawg")
+main_ids = non_awg + awg[:1]
+if not main_ids:
+    raise SystemExit("На сервере нет подключений.")
+
+existing_raw = api("GET", "clients/list")
+existing_list = existing_raw if isinstance(existing_raw, list) else existing_raw.get("clients", [])
+existing_emails = {c["email"].lower() for c in existing_list}
+
+db = sqlite3.connect(f"file:{old_db}?mode=ro", uri=True)
+db.row_factory = sqlite3.Row
+tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+rows = []
+if "clients" in tables:
+    cols = {r[1] for r in db.execute("PRAGMA table_info(clients)")}
+    want = [c for c in ("email", "sub_id", "uuid", "password", "auth", "limit_ip", "total_gb", "expiry_time", "enable") if c in cols]
+    for r in db.execute("SELECT " + ",".join(want) + " FROM clients"):
+        d = dict(r)
+        rows.append({
+            "email": d.get("email") or "",
+            "subId": d.get("sub_id") or "",
+            "id": d.get("uuid") or "",
+            "password": d.get("password") or "",
+            "auth": d.get("auth") or "",
+            "limitIp": int(d.get("limit_ip") or 0),
+            "totalGB": int(d.get("total_gb") or 0),
+            "expiryTime": int(d.get("expiry_time") or 0),
+            "enable": bool(d.get("enable", True)),
+        })
+elif "inbounds" in tables:
+    seen = {}
+    for (raw_s,) in db.execute("SELECT settings FROM inbounds"):
+        try:
+            cls = json.loads(raw_s or "{}").get("clients") or []
+        except Exception:
+            continue
+        for c in cls:
+            em = (c.get("email") or "").strip()
+            if em and em.lower() not in seen:
+                seen[em.lower()] = {
+                    "email": em,
+                    "subId": c.get("subId") or "",
+                    "id": c.get("id") or "",
+                    "password": c.get("password") or "",
+                    "auth": c.get("auth") or "",
+                    "limitIp": int(c.get("limitIp") or 0),
+                    "totalGB": int(c.get("totalGB") or 0),
+                    "expiryTime": int(c.get("expiryTime") or 0),
+                    "enable": bool(c.get("enable", True)),
+                }
+    rows = list(seen.values())
+db.close()
+
+added = skipped = 0
+for r in rows:
+    email = re.sub(r"\s+", "_", r["email"].strip())
+    if not email or email.lower() in existing_emails or re.search(r"-awg[0-9]*$", email):
+        skipped += 1
+        continue
+    client = {
+        "email": email,
+        "subId": r["subId"],
+        "id": r["id"],
+        "password": r["password"],
+        "auth": r["auth"],
+        "limitIp": r["limitIp"],
+        "totalGB": r["totalGB"],
+        "expiryTime": r["expiryTime"],
+        "enable": r["enable"],
+        "flow": "xtls-rprx-vision",
+        "comment": "waga",
+    }
+    api("POST", "clients/add", {"client": client, "inboundIds": main_ids})
+    if len(awg) > 1 and client["subId"]:
+        awg2 = {
+            "email": f"{email}-awg",
+            "subId": f"{client['subId']}-awg",
+            "limitIp": client["limitIp"],
+            "totalGB": client["totalGB"],
+            "expiryTime": client["expiryTime"],
+            "enable": client["enable"],
+            "comment": "waga",
+        }
+        try:
+            api("POST", "clients/add", {"client": awg2, "inboundIds": [awg[1]]})
+        except Exception as e:
+            print(f"  ! AWG 3.1 для {email}: {e}")
+    existing_emails.add(email.lower())
+    added += 1
+    print(f"  ✅ {email} (subId={client['subId'] or 'новый'}, limitIp={client['limitIp']})")
+print(f"\nГотово: перенесено {added}, пропущено {skipped}.")
+PY
 }
 
 cmd_del() {
@@ -1006,7 +1143,7 @@ check_exposure() {
       if ufw status | grep -Eq '^443/tcp +ALLOW'; then c_ok "ufw пропускает 443/tcp"; else c_bad "" "ufw не пропускает 443/tcp: ufw allow 443/tcp"; fi
     fi
   fi
-  for f in /etc/x-ui/install-result.env /etc/waga/waga.env /etc/waga-sub/config.json /root/waga.txt /root/cert/*/privkey.pem; do
+  for f in /etc/x-ui/install-result.env /etc/waga/waga.env /etc/waga/ddns.env /etc/waga-sub/config.json /root/waga.txt /root/cert/*/privkey.pem; do
     [[ -f $f ]] || continue
     m=$(stat -c %a "$f")
     [[ $m == 600 ]] || { c_bad perms "права на $f: $m (нужно 600)"; bad=1; }
@@ -1177,6 +1314,94 @@ print(json.dumps(cfg, ensure_ascii=False, indent=2))
 PY
 }
 
+
+# ---------- Автоустановка Cloudflare WARP (SOCKS5 127.0.0.1:40000) ----------
+
+warp_status() {
+  local trace ip warp_st
+  if command -v warp-cli >/dev/null 2>&1 && systemctl is-active -q warp-svc 2>/dev/null; then
+    trace=$(curl -4 -fsS -m 8 --socks5-hostname 127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    if grep -q '^warp=on' <<<"$trace"; then
+      ip=$(awk -F= '$1=="ip"{print $2}' <<<"$trace")
+      printf '%s\n' "${G}✅${N} Cloudflare WARP (SOCKS5 127.0.0.1:40000): работает (IP: ${ip:-?})"
+    else
+      printf '%s\n' "${Y}⚠ ${N} Cloudflare WARP установлен, но прокси 127.0.0.1:40000 не отвечает"
+    fi
+  else
+    printf '%s\n' "${D}ℹ ${N} Cloudflare WARP (127.0.0.1:40000): не установлен"
+  fi
+}
+
+warp_install() {
+  local os_id codename
+  os_id=$(. /etc/os-release && echo "${ID:-ubuntu}")
+  codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-noble}")
+  say "Устанавливаю Cloudflare WARP в режиме локального SOCKS5 (127.0.0.1:40000, без изменения маршрутов ОС)..."
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 update -qq >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y -qq gnupg lsb-release curl >/dev/null 2>&1 || true
+  curl -4fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \
+    || die "Не удалось скачать ключ репозитория Cloudflare WARP."
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${codename} main" \
+    >/etc/apt/sources.list.d/cloudflare-client.list
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 update -qq >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y -qq cloudflare-warp >/dev/null \
+    || die "Не удалось установить пакет cloudflare-warp (проверьте поддержку ${os_id}/${codename})."
+  systemctl enable --now warp-svc >/dev/null 2>&1 || true
+  sleep 2
+  warp-cli --accept-tos registration new >/dev/null 2>&1 || true
+  warp-cli --accept-tos mode proxy >/dev/null 2>&1 || die "Не удалось перевести WARP в режим proxy."
+  warp-cli --accept-tos proxy port 40000 >/dev/null 2>&1 || die "Не удалось задать порт 40000 для WARP."
+  warp-cli --accept-tos connect >/dev/null 2>&1 || die "Не удалось подключить WARP."
+  sleep 3
+  warp_status
+}
+
+warp_remove() {
+  if command -v warp-cli >/dev/null 2>&1; then
+    warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+  fi
+  systemctl disable --now warp-svc >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 purge -y -qq cloudflare-warp >/dev/null 2>&1 || true
+  rm -f /etc/apt/sources.list.d/cloudflare-client.list /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+  say "Cloudflare WARP удалён."
+}
+
+# ---------- Режим совместимости старого пути подписки (/sub/) ----------
+
+net_sub_legacy_status() {
+  if [[ -f $SEC_NGX_DIR/30-sub-legacy.conf ]]; then
+    printf '%s\n' "${G}✅${N} Совместимость старого пути /sub/: включена (клиенты со старыми ссылками /sub/<subId> работают)"
+  else
+    printf '%s\n' "${D}ℹ ${N} Совместимость старого пути /sub/: выключена"
+  fi
+}
+
+net_sub_legacy() { # on|off|status
+  local act=${1:-status} bak=""
+  case ${act,,} in
+    "" | status) net_sub_legacy_status ;;
+    on)
+      [[ ${SINGLE:-no} == yes && -f $PANEL_CONF ]] || die "Работает в режиме «всё на 443» с nginx."
+      sec_nginx_ensure_hooks
+      [[ -f $SEC_NGX_DIR/30-sub-legacy.conf ]] && { bak=$(mktemp); cp -p "$SEC_NGX_DIR/30-sub-legacy.conf" "$bak"; }
+      cat >"$SEC_NGX_DIR/30-sub-legacy.conf" <<EOF
+# WAGA: алиас старого пути /sub/<subId> на waga-sub (${SUB_PATH})
+location ~ ^/sub/(.+)$ {
+    include /etc/nginx/waga-limit.d/*.conf;
+    proxy_pass http://127.0.0.1:10460${SUB_PATH}\$1;
+    proxy_set_header Host \$host;
+}
+EOF
+      sec_nginx_reload_or_rollback "$SEC_NGX_DIR/30-sub-legacy.conf" "$bak" || die "nginx не принял алиас /sub/."
+      say "Совместимость /sub/ включена: старые ссылки https://${LINK_HOST:-$HOST}/sub/<subId> теперь работают." ;;
+    off)
+      rm -f "$SEC_NGX_DIR/30-sub-legacy.conf"
+      command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+      say "Совместимость старого пути /sub/ выключена." ;;
+    *) die "waga net sub-legacy [on|off|status]" ;;
+  esac
+}
+
 net_gemini() {
   local act=${1:-show} addr=${2:-127.0.0.1:40000} all cur patched st cnt mode
   all=$(api POST setting/all '{}'); cur=$(jq -r '.xrayTemplateConfig // ""' <<<"$all")
@@ -1240,9 +1465,31 @@ net_happ() {
   esac
 }
 
+
+check_dns() {
+  if getent ahostsv4 raw.githubusercontent.com >/dev/null 2>&1 || getent ahostsv4 github.com >/dev/null 2>&1; then
+    c_ok "DNS на сервере работает"
+  else
+    c_bad dns "DNS на сервере не разрешает имена (waga fix пропишет 1.1.1.1 и 8.8.8.8)"
+  fi
+}
+
+fix_dns() {
+  say "Настраиваю рабочие DNS (1.1.1.1 и 8.8.8.8)"
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    mkdir -p /etc/systemd/resolved.conf.d
+    printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\nFallbackDNS=9.9.9.9\n' >/etc/systemd/resolved.conf.d/waga-dns.conf
+    systemctl restart systemd-resolved >/dev/null 2>&1 || true
+    sleep 1
+  else
+    rm -f /etc/resolv.conf 2>/dev/null || true
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >/etc/resolv.conf
+  fi
+}
+
 run_checks() {
   CHECK_BAD=0; CHECK_WARN=0; CHECK_FIX=()
-  check_services; check_xray; check_routes; check_grace; check_mtproto; check_versions; check_cert; check_exposure; check_subscription; check_masking; check_stealth; check_gemini; check_system
+  check_services; check_xray; check_routes; check_grace; check_mtproto; check_versions; check_cert; check_exposure; check_subscription; check_masking; check_stealth; check_dns; check_gemini; check_system
 }
 
 # waga check --deep: подключения проверяются так, как это делает клиент, – с самого сервера.
@@ -1402,6 +1649,7 @@ fix_action() { # код
       if nginx -t >/dev/null 2>&1; then say "Перечитываю сертификат в nginx"; systemctl reload nginx
       else warn "Конфиг nginx не проходит проверку – сертификат не перечитываю."; fi
       warn "Если сертификат всё ещё просрочен, запустите продление: ~/.acme.sh/acme.sh --cron" ;;
+    dns) fix_dns ;;
     ntp) fix_ntp ;;
     route) fix_route ;;
     gemini) say "Восстанавливаю домены GEMINI в панели"; net_gemini ipv4 || true ;;
@@ -2811,6 +3059,7 @@ if mode == "domain":
     server_tokens off;
     absolute_redirect off;
     access_log off;
+    include /etc/nginx/waga-sec.d/*.conf;
     # waga:panel-on-domain
 {locs}
     location / {{
@@ -2827,6 +3076,7 @@ else:
     ssl_protocols TLSv1.2 TLSv1.3;
     server_tokens off;
     access_log off;
+    include /etc/nginx/waga-sec.d/*.conf;
     location / {{
         root /var/www/waga;
         index index.html;
@@ -2906,6 +3156,7 @@ net_panel() { # [domain|ip]
     dns_a "$domain" | grep -qx "$(host_ip)" || die "Домен $domain не указывает на этот сервер ($(host_ip)). Исправьте A-запись и повторите."
     [[ -s $cert && -s $key ]] || die "Нет сертификата домена ($cert) – не трогаю nginx."
   fi
+  install -d -m 755 /etc/nginx/waga-sec.d /etc/nginx/waga-limit.d
   tmp=$(mktemp); bak=$(mktemp); cp -p "$PANEL_CONF" "$bak"
   local -a ex=()
   mapfile -t ex < <(jq -r '.extra_paths[]?' /etc/waga-sub/config.json 2>/dev/null || true)
@@ -3094,6 +3345,8 @@ cmd_net() {
     gemini) net_gemini "$@" ;;
     awg) net_awg_obf "$@" ;;
     happ) net_happ ;;
+    sub-legacy) net_sub_legacy "$@" ;;
+    warp) case ${1:-status} in install|on) warp_install ;; remove|off) warp_remove ;; *) warp_status ;; esac ;;
     *) die "waga net [site [cleanup] | port имя порт | off имя | on имя | fp отпечаток | masq on|off | dns on|off | panel domain|ip | split on|off|check|apply | vision on|off]" ;;
   esac
 }
@@ -3169,13 +3422,14 @@ u_toggle() {
   case $REPLY in 1) cmd_toggle "$PICK" false ;; 2) cmd_toggle "$PICK" true ;; *) echo "Отменено." ;; esac
 }
 u_del() { pick_user || return 0; cmd_del "$PICK"; }
+u_import() { ask_tty "Путь к старой базе 3X-UI (напр. /root/old-x-ui.db): "; [[ -n ${REPLY//[[:space:]]/} ]] && cmd_import "${REPLY//[[:space:]]/}"; }
 
 menu_users() {
   local c
   while :; do
     echo
-    box "Пользователи" "1. Список (трафик, срок, статус)" "2. Добавить" "3. Показать ссылки" "4. Изменить лимит" "5. Выключить или включить" "6. Удалить" "" "0. Назад"
-    ask_num "Выбор [0-6]: "; c=$REPLY
+    box "Пользователи" "1. Список (трафик, срок, статус)" "2. Добавить" "3. Показать ссылки" "4. Изменить лимит" "5. Выключить или включить" "6. Удалить" "7. Импорт клиентов из старой БД" "" "0. Назад"
+    ask_num "Выбор [0-7]: "; c=$REPLY
     case $c in
       1) run_action cmd_list; pause ;;
       2) run_action u_add; pause ;;
@@ -3183,6 +3437,7 @@ menu_users() {
       4) run_action u_limit; pause ;;
       5) run_action u_toggle; pause ;;
       6) run_action u_del; pause ;;
+      7) run_action u_import; pause ;;
       0 | "") return 0 ;;
       *) echo "Нет такого пункта." ;;
     esac
@@ -3267,14 +3522,40 @@ n_vision() {
   case $REPLY in 1) cmd_vision --all ;; 2) cmd_vision --all off ;; esac
 }
 
-n_gemini() { net_gemini show; echo; ask_num "1 – IPv4, 2 – WARP (127.0.0.1:40000), 3 – свой SOCKS5, 4 – direct, Enter – назад: "; case $REPLY in 1) net_gemini ipv4 ;; 2) net_gemini warp 127.0.0.1:40000 ;; 3) ask_tty "SOCKS5 (IP:PORT): "; [[ -n ${REPLY//[[:space:]]/} ]] && net_gemini warp "${REPLY//[[:space:]]/}" ;; 4) net_gemini direct ;; esac; }
+n_gemini() {
+  net_gemini show
+  warp_status
+  echo
+  echo "  1. Маршрут GEMINI → IPv4 сервера (UseIPv4)"
+  echo "  2. Маршрут GEMINI → WARP (127.0.0.1:40000)"
+  echo "  3. Маршрут GEMINI → свой SOCKS5 (IP:PORT)"
+  echo "  4. Маршрут GEMINI → обычный direct"
+  echo "  5. Установить Cloudflare WARP (127.0.0.1:40000) в один клик"
+  echo "  6. Удалить Cloudflare WARP"
+  echo "  0. Назад"
+  ask_num "Выбор [0-6]: "
+  case $REPLY in
+    1) net_gemini ipv4 ;;
+    2) net_gemini warp 127.0.0.1:40000 ;;
+    3) ask_tty "SOCKS5 (IP:PORT): "; [[ -n ${REPLY//[[:space:]]/} ]] && net_gemini warp "${REPLY//[[:space:]]/}" ;;
+    4) net_gemini direct ;;
+    5) warp_install ;;
+    6) warp_remove ;;
+  esac
+}
+n_sub_legacy() {
+  net_sub_legacy_status
+  echo
+  ask_num "1 – включить (/sub/<subId> → waga-sub), 2 – выключить, Enter – назад: "
+  case $REPLY in 1) net_sub_legacy on ;; 2) net_sub_legacy off ;; esac
+}
 n_awg_obf() { ask_num "Обфускация AWG: 1 – classic, 2 – mid, 3 – full (3.1), Enter – назад: "; case $REPLY in 1) net_awg_obf classic ;; 2) net_awg_obf mid ;; 3) net_awg_obf full ;; esac; }
 menu_net() {
   local c
   while :; do
     echo
-    box "Протоколы, порты и маскировка" "1. Показать протоколы и порты" "2. Сменить сайт маскировки" "3. Сменить порт протокола" "4. Выключить или включить протокол" "5. Сменить отпечаток клиента" "6. Второй REALITY на высоком порту" "7. Панель и подписка: по IP или по домену" "8. Раздельная маршрутизация" "9. DNS в подписках (против утечек)" "10. Hysteria2: ответ чужим запросам" "11. Убрать прежние имена сайта" "12. Поток vision у REALITY" "13. Маршрутизация GEMINI в панели" "14. Обфускация AmneziaWG" "15. Happ: баннер и внешние ноды" "" "0. Назад"
-    ask_num "Выбор [0-15]: "; c=$REPLY
+    box "Протоколы, порты и маскировка" "1. Показать протоколы и порты" "2. Сменить сайт маскировки" "3. Сменить порт протокола" "4. Выключить или включить протокол" "5. Сменить отпечаток клиента" "6. Второй REALITY на высоком порту" "7. Панель и подписка: по IP или по домену" "8. Раздельная маршрутизация" "9. DNS в подписках (против утечек)" "10. Hysteria2: ответ чужим запросам" "11. Убрать прежние имена сайта" "12. Поток vision у REALITY" "13. Маршрутизация GEMINI в панели" "14. Обфускация AmneziaWG" "15. Happ: баннер и внешние ноды" "16. Совместимость старого пути /sub/" "" "0. Назад"
+    ask_num "Выбор [0-16]: "; c=$REPLY
     case $c in
       1) run_action net_show; pause ;;
       2) run_action n_site; pause ;;
@@ -3291,6 +3572,7 @@ menu_net() {
       13) run_action n_gemini; pause ;;
       14) run_action n_awg_obf; pause ;;
       15) run_action net_happ; pause ;;
+      16) run_action n_sub_legacy; pause ;;
       0 | "") return 0 ;;
       *) echo "Нет такого пункта." ;;
     esac
@@ -3317,7 +3599,7 @@ menu_auto() {
   local ans
   if auto_enabled; then
     ask_tty "Автообновление сейчас включено (ночью, только подписанные релизы). Выключить? [y/N] "
-    [[ $REPLY =~ ^[yYдД]$ ]] && auto_off && say "Автообновление выключено. Обновляться вручную: пункт 4."
+    [[ $REPLY =~ ^[yYдД]$ ]] && auto_off && say "Автообновление выключено. Обновляться вручную: пункт 5."
   else
     ask_tty "Автообновление сейчас выключено. Включить? [y/N] "
     [[ $REPLY =~ ^[yYдД]$ ]] && auto_on && say "Автообновление включено."
@@ -3325,29 +3607,1186 @@ menu_auto() {
   return 0
 }
 
+
+# ---------- защита и оптимизация сервера (ручная установка из меню waga) ----------
+
+SEC_SYSCTL_FILE=/etc/sysctl.d/99-waga-security.conf
+SEC_APT_AUTO=/etc/apt/apt.conf.d/20auto-upgrades
+SEC_APT_CONF=/etc/apt/apt.conf.d/51waga-security-upgrades
+SEC_F2B_JAIL=/etc/fail2ban/jail.d/waga.local
+SEC_F2B_SCAN=/etc/fail2ban/filter.d/waga-nginx-scan.conf
+SEC_F2B_LIM=/etc/fail2ban/filter.d/waga-nginx-limit.conf
+SEC_DDNS_ENV=/etc/waga/ddns.env
+SEC_DDNS_BIN=/usr/local/lib/waga/ddns-update.sh
+SEC_NGX_ZONES=/etc/nginx/conf.d/00-waga-sec-zones.conf
+SEC_NGX_DIR=/etc/nginx/waga-sec.d
+SEC_NGX_LIM_DIR=/etc/nginx/waga-limit.d
+SEC_NGX_LOG=/var/log/nginx/waga-sec.log
+
+sec_ssh_ports() {
+  { sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'
+    ss -H -ltnp 2>/dev/null | awk '/"sshd"/ {n = split($4, a, ":"); print a[n]}'
+    awk '{print $4}' <<<"${SSH_CONNECTION:-}"
+  } | grep -E '^[0-9]{1,5}$' | sort -un | paste -sd, - || echo "22"
+}
+
+sec_nginx_ensure_hooks() {
+  local conf=$PANEL_CONF ppath spath bak tmp
+  local -a paths=()
+  [[ -f $conf ]] || die "Конфиг nginx $conf не найден (функция доступна в режиме «всё на 443»)."
+  install -d -m 755 "$SEC_NGX_DIR" "$SEC_NGX_LIM_DIR"
+  spath=${SUB_PATH:-}
+  ppath=$(panel_web_path 2>/dev/null || true)
+  [[ -n $spath ]] && paths+=("$spath")
+  [[ -n $ppath ]] && paths+=("$ppath")
+  if [[ -f /etc/waga-sub/config.json ]]; then
+    local ex
+    while IFS= read -r ex; do [[ -n $ex ]] && paths+=("$ex"); done < <(jq -r '.extra_paths[]?' /etc/waga-sub/config.json 2>/dev/null || true)
+  fi
+  bak=$(mktemp); tmp=$(mktemp)
+  cp -p "$conf" "$bak"
+  if ! python3 - "$conf" "${paths[@]}" >"$tmp" <<'PY'
+import re, sys
+
+conf = sys.argv[1]
+target_paths = [p for p in sys.argv[2:] if p]
+text = open(conf, encoding="utf-8").read()
+
+sec_inc = "    include /etc/nginx/waga-sec.d/*.conf;"
+lim_inc = "        include /etc/nginx/waga-limit.d/*.conf;"
+
+def match_brace(t, start):
+    depth = 0
+    for j in range(start, len(t)):
+        if t[j] == "{":
+            depth += 1
+        elif t[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return -1
+
+def patch_server(blk):
+    if "waga-sec.d/*.conf" not in blk:
+        m = re.search(r"^[ \t]*access_log[ \t]+[^;]+;\s*$", blk, re.M)
+        if m:
+            blk = blk[:m.end()] + "\n" + sec_inc + blk[m.end():]
+        else:
+            m2 = re.search(r"^[ \t]*location[ \t]+", blk, re.M)
+            if m2:
+                blk = blk[:m2.start()] + sec_inc + "\n" + blk[m2.start():]
+    for path in target_paths:
+        pat = re.compile(r"(^[ \t]*location[ \t]+" + re.escape(path) + r"[ \t]*\{)", re.M)
+        pos = 0
+        while True:
+            m = pat.search(blk, pos)
+            if not m:
+                break
+            end = match_brace(blk, m.end() - 1)
+            if end == -1:
+                break
+            loc_blk = blk[m.start():end]
+            if "waga-limit.d/*.conf" not in loc_blk:
+                ins = m.end()
+                blk = blk[:ins] + "\n" + lim_inc + blk[ins:]
+                pos = end + len(lim_inc) + 1
+            else:
+                pos = end
+    return blk
+
+out = []
+i = 0
+while True:
+    m = re.search(r"^server\s*\{", text[i:], re.M)
+    if not m:
+        out.append(text[i:])
+        break
+    a = i + m.start()
+    b = match_brace(text, a)
+    if b == -1:
+        out.append(text[i:])
+        break
+    out.append(text[i:a])
+    out.append(patch_server(text[a:b]))
+    i = b
+
+sys.stdout.write("".join(out))
+PY
+  then
+    rm -f "$bak" "$tmp"
+    die "Не удалось подготовить конфиг nginx $conf."
+  fi
+  cat "$tmp" >"$conf"
+  if ! nginx -t >/dev/null 2>&1; then
+    cat "$bak" >"$conf"
+    rm -f "$bak" "$tmp"
+    die "nginx не принял обновлённый конфиг – всё возвращено как было."
+  fi
+  rm -f "$bak" "$tmp"
+}
+
+sec_nginx_reload_or_rollback() { # файл-конфига бэкап-или-пусто
+  local target=$1 bak=${2:-} err=""
+  if err=$(nginx -t 2>&1) && systemctl reload nginx; then
+    [[ -n $bak ]] && rm -f "$bak"
+    return 0
+  fi
+  if [[ -n $bak && -f $bak ]]; then
+    cat "$bak" >"$target"
+    rm -f "$bak"
+  else
+    rm -f "$target"
+  fi
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+  warn "nginx отклонил конфигурацию: $(tail -n 2 <<<"$err" | tr '\n' ' ')"
+  return 1
+}
+
+# --- 1. Сетевой тюнинг ядра (sysctl) ---
+
+sec_sysctl_status() {
+  local cc qd rmem wmem syn rp redir
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+  qd=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+  rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "?")
+  wmem=$(sysctl -n net.core.wmem_max 2>/dev/null || echo "?")
+  syn=$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null || echo "?")
+  rp=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo "?")
+  redir=$(sysctl -n net.ipv4.conf.all.accept_redirects 2>/dev/null || echo "?")
+  if [[ -f $SEC_SYSCTL_FILE ]]; then
+    printf '%s\n' "${G}✅${N} Тюнинг ядра sysctl: включён ($SEC_SYSCTL_FILE)"
+  else
+    printf '%s\n' "${D}ℹ ${N} Тюнинг ядра sysctl: не установлен"
+  fi
+  echo "   TCP: $cc / $qd · UDP-буферы: rmem=$rmem wmem=$wmem · syncookies=$syn · rp_filter=$rp · accept_redirects=$redir"
+}
+
+sec_sysctl_on() {
+  modprobe tcp_bbr 2>/dev/null || true
+  cat >"$SEC_SYSCTL_FILE" <<'EOF'
+# WAGA: сетевой тюнинг (BBR + UDP-буферы для Hysteria2/AmneziaWG) и защита стека TCP/IP
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+EOF
+  sysctl -e -p "$SEC_SYSCTL_FILE" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+  say "Тюнинг ядра sysctl применён."
+  sec_sysctl_status
+}
+
+sec_sysctl_off() {
+  if [[ ! -f $SEC_SYSCTL_FILE ]]; then
+    say "Файл $SEC_SYSCTL_FILE не установлен."
+    return 0
+  fi
+  rm -f "$SEC_SYSCTL_FILE"
+  sysctl --system >/dev/null 2>&1 || true
+  say "Тюнинг ядра sysctl от WAGA удалён (значения по умолчанию вернутся после перезагрузки или sysctl)."
+}
+
+# --- 2. Автообновления безопасности ОС (unattended-upgrades) ---
+
+sec_updates_status() {
+  if [[ -f $SEC_APT_CONF ]] && grep -q 'Unattended-Upgrade "1"' "$SEC_APT_AUTO" 2>/dev/null; then
+    printf '%s\n' "${G}✅${N} Автообновления безопасности ОС: включены (только security, без автоперезагрузки, x-ui/xray не трогаются)"
+  else
+    printf '%s\n' "${D}ℹ ${N} Автообновления безопасности ОС: не настроены"
+  fi
+}
+
+sec_updates_on() {
+  if ! dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q "install ok installed"; then
+    say "Устанавливаю пакет unattended-upgrades..."
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y -qq unattended-upgrades >/dev/null \
+      || die "Не удалось установить unattended-upgrades."
+  fi
+  cat >"$SEC_APT_AUTO" <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+  cat >"$SEC_APT_CONF" <<'EOF'
+// WAGA: только обновления безопасности ОС, без перезагрузок и без сторонних пакетов
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+};
+Unattended-Upgrade::Package-Blacklist {
+    "x-ui";
+    "xray";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+EOF
+  systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  say "Автообновления безопасности ОС включены (только security-патчи, без перезагрузок)."
+}
+
+sec_updates_off() {
+  rm -f "$SEC_APT_CONF"
+  if [[ -f $SEC_APT_AUTO ]]; then
+    sed -i 's/Unattended-Upgrade "1"/Unattended-Upgrade "0"/' "$SEC_APT_AUTO"
+  fi
+  say "Автообновления безопасности ОС от WAGA выключены."
+}
+
+# --- 3. Fail2ban (sshd + nginx + ignoreip) ---
+
+sec_f2b_get_ignoreip() {
+  if [[ -f $SEC_F2B_JAIL ]]; then
+    awk -F= '/^[[:space:]]*ignoreip[[:space:]]*=/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' "$SEC_F2B_JAIL"
+  else
+    echo "127.0.0.1/8 ::1"
+  fi
+}
+
+sec_f2b_status() {
+  local ig banned="" j
+  if [[ -f $SEC_F2B_JAIL ]] && systemctl is-active -q fail2ban 2>/dev/null; then
+    ig=$(sec_f2b_get_ignoreip)
+    printf '%s\n' "${G}✅${N} Fail2ban (WAGA): активен"
+    echo "   Белый список (ignoreip): $ig"
+    for j in sshd waga-nginx-scan waga-nginx-limit; do
+      if fail2ban-client status "$j" >/dev/null 2>&1; then
+        banned=$(fail2ban-client status "$j" 2>/dev/null | awk -F: '/Currently banned/ {gsub(/ /,"",$2); print $2}')
+        echo "   Джейл $j: активен (в бане: ${banned:-0})"
+      fi
+    done
+  else
+    printf '%s\n' "${D}ℹ ${N} Fail2ban (WAGA): не настроен"
+  fi
+}
+
+sec_f2b_validate_ip() { # ip-или-cidr
+  python3 - "$1" <<'PY' >/dev/null 2>&1
+import ipaddress, sys
+ipaddress.ip_network(sys.argv[1], strict=False)
+PY
+}
+
+sec_f2b_write_jail() { # строка-ignoreip
+  local ig=$1 sshp
+  sshp=$(sec_ssh_ports)
+  install -d -m 755 /etc/fail2ban/jail.d /etc/fail2ban/filter.d
+  cat >"$SEC_F2B_SCAN" <<'EOF'
+[Definition]
+failregex = ^<HOST> - \S+ \[.*?\] "(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) .*? HTTP/\S+" (?:400|401|403|404|444) \d+
+            ^<HOST> - \S+ \[.*?\] "[^"]*" 444 0
+ignoreregex = /favicon\.ico|/robots\.txt
+EOF
+  cat >"$SEC_F2B_LIM" <<'EOF'
+[Definition]
+failregex = limiting requests, excess: .* by zone "waga_req", client: <HOST>,
+            limiting connections by zone "waga_conn", client: <HOST>,
+ignoreregex =
+EOF
+  {
+    echo "# WAGA: защита SSH и Nginx с белым списком ignoreip"
+    echo "[DEFAULT]"
+    echo "ignoreip = $ig"
+    echo "bantime = 1h"
+    echo "findtime = 10m"
+    echo "maxretry = 5"
+    echo ""
+    echo "[sshd]"
+    echo "enabled = true"
+    echo "port = ${sshp:-22}"
+    echo "backend = systemd"
+    echo "maxretry = 5"
+    echo "bantime = 1h"
+    if [[ ${SINGLE:-no} == yes && -f $PANEL_CONF ]]; then
+      echo ""
+      echo "[waga-nginx-scan]"
+      echo "enabled = true"
+      echo "port = http,https"
+      echo "filter = waga-nginx-scan"
+      echo "logpath = $SEC_NGX_LOG"
+      echo "maxretry = 12"
+      echo "findtime = 2m"
+      echo "bantime = 1h"
+      echo ""
+      echo "[waga-nginx-limit]"
+      echo "enabled = true"
+      echo "port = http,https"
+      echo "filter = waga-nginx-limit"
+      echo "logpath = /var/log/nginx/error.log"
+      echo "maxretry = 6"
+      echo "findtime = 2m"
+      echo "bantime = 1h"
+    fi
+  } >"$SEC_F2B_JAIL"
+}
+
+sec_f2b_on() { # [extra_ignoreip]
+  local extra=${1:-} cur_ip="" ig
+  if ! command -v fail2ban-client >/dev/null 2>&1; then
+    say "Устанавливаю Fail2ban..."
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y -qq fail2ban >/dev/null \
+      || die "Не удалось установить fail2ban."
+  fi
+  ig=$(sec_f2b_get_ignoreip)
+  cur_ip=${SSH_CONNECTION%% *}
+  if [[ -n $cur_ip ]] && sec_f2b_validate_ip "$cur_ip" && [[ " $ig " != *" $cur_ip "* ]]; then
+    if [[ -z $extra && -t 0 && -t 1 ]]; then
+      ask_tty "Добавить ваш текущий IP ($cur_ip) в белый список ignoreip от самобана? [Y/n] "
+      [[ ${REPLY,,} == n* || ${REPLY,,} == н* ]] || ig="$ig $cur_ip"
+    else
+      ig="$ig $cur_ip"
+    fi
+  fi
+  if [[ -n $extra ]]; then
+    local tok
+    for tok in $extra; do
+      sec_f2b_validate_ip "$tok" || die "Неверный IP или подсеть: $tok"
+      [[ " $ig " == *" $tok "* ]] || ig="$ig $tok"
+    done
+  fi
+  if [[ ${SINGLE:-no} == yes && -f $PANEL_CONF ]]; then
+    sec_nginx_ensure_hooks
+    touch "$SEC_NGX_LOG" /var/log/nginx/error.log
+    chown www-data:adm "$SEC_NGX_LOG" 2>/dev/null || true
+    cat >"$SEC_NGX_DIR/10-log.conf" <<EOF
+# WAGA: журнал доступа для Fail2ban (перебор путей панели и массовые 404/444)
+access_log $SEC_NGX_LOG combined;
+EOF
+    cat >/etc/logrotate.d/waga-nginx <<EOF
+$SEC_NGX_LOG {
+    daily
+    missingok
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+    create 0640 www-data adm
+    sharedscripts
+    postrotate
+        systemctl reload nginx >/dev/null 2>&1 || true
+    endscript
+}
+EOF
+    sec_nginx_reload_or_rollback "$SEC_NGX_DIR/10-log.conf" "" || die "Не удалось включить журнал nginx для Fail2ban."
+  fi
+  sec_f2b_write_jail "$ig"
+  systemctl enable fail2ban >/dev/null 2>&1 || true
+  systemctl restart fail2ban || die "Fail2ban не запустился – проверьте: journalctl -u fail2ban -n 30"
+  say "Fail2ban настроен и запущен."
+  sec_f2b_status
+}
+
+sec_f2b_ignoreip_add() {
+  local raw=${1:-} ig tok changed=no
+  [[ -f $SEC_F2B_JAIL ]] || die "Сначала включите Fail2ban (пункт 1)."
+  [[ -n $raw ]] || die "Укажите IP или подсеть (например 109.252.0.0/16)."
+  ig=$(sec_f2b_get_ignoreip)
+  for tok in $raw; do
+    sec_f2b_validate_ip "$tok" || die "Неверный IP или подсеть: $tok"
+    if [[ " $ig " != *" $tok "* ]]; then
+      ig="$ig $tok"
+      changed=yes
+    fi
+  done
+  if [[ $changed == yes ]]; then
+    sec_f2b_write_jail "$ig"
+    systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban
+    say "Обновлён белый список ignoreip: $ig"
+  else
+    say "Эти адреса уже в белом списке: $ig"
+  fi
+}
+
+sec_f2b_ignoreip_del() {
+  local target=${1:-} ig new="" tok
+  [[ -f $SEC_F2B_JAIL ]] || die "Fail2ban (WAGA) не настроен."
+  [[ -n $target ]] || die "Укажите IP или подсеть для удаления."
+  [[ $target == 127.0.0.1/8 || $target == ::1 ]] && die "Локальный адрес $target удалять нельзя."
+  ig=$(sec_f2b_get_ignoreip)
+  for tok in $ig; do
+    [[ $tok == "$target" ]] || new+="${new:+ }$tok"
+  done
+  sec_f2b_write_jail "$new"
+  systemctl reload fail2ban 2>/dev/null || systemctl restart fail2ban
+  say "Удалено из ignoreip. Текущий список: $new"
+}
+
+sec_f2b_unban() {
+  local target=${1:---all}
+  command -v fail2ban-client >/dev/null 2>&1 || die "Fail2ban не установлен."
+  if [[ $target == --all || $target == all ]]; then
+    fail2ban-client unban --all >/dev/null 2>&1 || true
+    say "Все временные баны Fail2ban сняты."
+  else
+    sec_f2b_validate_ip "$target" || die "Неверный IP: $target"
+    fail2ban-client unban "$target" >/dev/null 2>&1 || true
+    say "Адрес $target разбанен."
+  fi
+}
+
+sec_f2b_off() {
+  rm -f "$SEC_F2B_JAIL" "$SEC_F2B_SCAN" "$SEC_F2B_LIM" "$SEC_NGX_DIR/10-log.conf" /etc/logrotate.d/waga-nginx
+  if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx >/dev/null 2>&1 || true
+  fi
+  if systemctl is-active -q fail2ban 2>/dev/null; then
+    fail2ban-client reload >/dev/null 2>&1 || systemctl restart fail2ban >/dev/null 2>&1 || true
+  fi
+  say "Правила Fail2ban от WAGA выключены и удалены."
+}
+
+# --- 4. Автообновление домена (DDNS + TLS-сертификат) ---
+
+sec_domain_status() {
+  local cert="" end left
+  if systemctl is-enabled -q waga-ddns.timer 2>/dev/null && [[ -f $SEC_DDNS_ENV ]]; then
+    local mode dom
+    mode=$(awk -F= '/^DDNS_MODE=/ {gsub(/"/, "", $2); print $2}' "$SEC_DDNS_ENV" 2>/dev/null || echo "?")
+    dom=$(awk -F= '/^DDNS_DOMAIN=/ {gsub(/"/, "", $2); print $2}' "$SEC_DDNS_ENV" 2>/dev/null || echo "")
+    printf '%s\n' "${G}✅${N} Автообновление домена (DDNS): активно ($mode${dom:+, $dom.duckdns.org}, каждые 5 мин)"
+  else
+    printf '%s\n' "${D}ℹ ${N} Автообновление домена (DDNS): выключено"
+  fi
+  for cert in /root/cert/domain/fullchain.pem /root/cert/ip/fullchain.pem; do
+    [[ -f $cert ]] || continue
+    end=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2 || true)
+    [[ -n $end ]] || continue
+    left=$((($(date -d "$end" +%s) - $(date +%s)) / 86400))
+    echo "   TLS ($cert): действителен ещё ~${left} дн."
+  done
+}
+
+sec_ddns_install_units() {
+  install -d -m 755 /usr/local/lib/waga
+  cat >"$SEC_DDNS_BIN" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+ENV_FILE=/etc/waga/ddns.env
+[[ -f $ENV_FILE ]] || exit 0
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+
+ip=""
+for u in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
+  ip=$(curl -4 -fsS -m 8 "$u" 2>/dev/null | tr -d '[:space:]') || true
+  [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+  ip=""
+done
+[[ -n $ip ]] || { echo "WAGA DDNS: не удалось определить IPv4" >&2; exit 1; }
+
+if [[ ${DDNS_MODE:-} == duckdns ]]; then
+  resp=$(printf 'url = "https://www.duckdns.org/update?domains=%s&token=%s&ip=%s"\n' "$DDNS_DOMAIN" "$DDNS_TOKEN" "$ip" \
+    | curl -4 -fsS -m 15 -K - 2>/dev/null || true)
+  if [[ $resp == OK ]]; then
+    echo "WAGA DDNS: ${DDNS_DOMAIN}.duckdns.org -> $ip (OK)"
+  else
+    echo "WAGA DDNS: ошибка обновления ${DDNS_DOMAIN}.duckdns.org (ответ: ${resp:-пусто})" >&2
+    exit 1
+  fi
+elif [[ ${DDNS_MODE:-} == url && -n ${DDNS_URL:-} ]]; then
+  final_url=${DDNS_URL//\{IP\}/$ip}
+  printf 'url = "%s"\n' "$final_url" | curl -4 -fsS -m 15 -K - >/dev/null
+  echo "WAGA DDNS: webhook выполнен (IP=$ip)"
+fi
+SCRIPT
+  chmod 700 "$SEC_DDNS_BIN"
+  cat >/etc/systemd/system/waga-ddns.service <<UNIT
+[Unit]
+Description=WAGA: автообновление A-записи домена (DDNS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SEC_DDNS_BIN
+UNIT
+  cat >/etc/systemd/system/waga-ddns.timer <<'UNIT'
+[Unit]
+Description=WAGA: проверка и обновление домена (DDNS) каждые 5 минут
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now waga-ddns.timer >/dev/null 2>&1
+}
+
+sec_ddns_duckdns() { # домен токен
+  local dom=${1:-} tok=${2:-}
+  dom=${dom,,}; dom=${dom%.duckdns.org}; dom=${dom// /}
+  tok=${tok// /}
+  [[ $dom =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "Неверное имя поддомена DuckDNS: $dom"
+  [[ $tok =~ ^[A-Za-z0-9-]{8,128}$ ]] || die "Неверный формат токена DuckDNS."
+  install -d -m 700 /etc/waga
+  (umask 077; printf 'DDNS_MODE="duckdns"\nDDNS_DOMAIN=%q\nDDNS_TOKEN=%q\n' "$dom" "$tok" >"$SEC_DDNS_ENV")
+  chmod 600 "$SEC_DDNS_ENV"
+  sec_ddns_install_units
+  if "$SEC_DDNS_BIN"; then
+    say "Автообновление DuckDNS (${dom}.duckdns.org) включено и проверено (таймер каждые 5 мин)."
+  else
+    sec_ddns_off >/dev/null 2>&1 || true
+    die "DuckDNS вернул ошибку (проверьте имя домена и токен). Таймер не активирован."
+  fi
+}
+
+sec_ddns_url() { # https://...
+  local url=${1:-}
+  [[ $url == https://* && $url != *'"'* && $url != *$'\n'* ]] || die "Нужна корректная HTTPS-ссылка (можно использовать {IP} для подстановки IPv4)."
+  install -d -m 700 /etc/waga
+  (umask 077; printf 'DDNS_MODE="url"\nDDNS_URL=%q\n' "$url" >"$SEC_DDNS_ENV")
+  chmod 600 "$SEC_DDNS_ENV"
+  sec_ddns_install_units
+  "$SEC_DDNS_BIN" && say "Автообновление домена по DDNS URL включено (таймер каждые 5 мин)."
+}
+
+sec_ddns_off() {
+  systemctl disable --now waga-ddns.timer waga-ddns.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/waga-ddns.timer /etc/systemd/system/waga-ddns.service "$SEC_DDNS_ENV" "$SEC_DDNS_BIN"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  say "Автообновление домена (DDNS) выключено."
+}
+
+sec_domain_tls_renew() {
+  if [[ -x /root/.acme.sh/acme.sh ]]; then
+    say "Запускаю проверку продления TLS-сертификатов (acme.sh --cron)..."
+    /root/.acme.sh/acme.sh --cron --home /root/.acme.sh || warn "acme.sh завершился с предупреждением (возможно, срок продления ещё не наступил)."
+    echo '17 4 * * * root systemctl reload nginx >/dev/null 2>&1' >/etc/cron.d/waga-nginx-reload
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+    say "Автопродление TLS и перечитывание сертификата nginx проверены."
+  else
+    warn "acme.sh не найден в /root/.acme.sh/acme.sh."
+  fi
+  sec_domain_status
+}
+
+# --- 5. Rate limiting в Nginx (панель и waga-sub) ---
+
+sec_ratelimit_status() {
+  if [[ -f $SEC_NGX_ZONES && -f $SEC_NGX_LIM_DIR/10-limit.conf ]]; then
+    local rate burst conn
+    rate=$(sed -n 's/.*rate=\([^; ]*\).*/\1/p' "$SEC_NGX_ZONES" | head -1)
+    burst=$(sed -n 's/.*burst=\([0-9]*\).*/\1/p' "$SEC_NGX_LIM_DIR/10-limit.conf" | head -1)
+    conn=$(awk '$1 == "limit_conn" {sub(/;/,"",$3); print $3; exit}' "$SEC_NGX_LIM_DIR/10-limit.conf")
+    printf '%s\n' "${G}✅${N} Rate limiting в Nginx: включён (rate=${rate:-5r/s}, burst=${burst:-10}, limit_conn=${conn:-20})"
+  else
+    printf '%s\n' "${D}ℹ ${N} Rate limiting в Nginx: выключен"
+  fi
+}
+
+sec_ratelimit_on() { # [rate] [burst] [conn]
+  local rate=${1:-5r/s} burst=${2:-10} conn=${3:-20} bak_z="" bak_l=""
+  [[ ${SINGLE:-no} == yes && -f $PANEL_CONF ]] || die "Rate limiting Nginx работает в режиме «всё на 443»."
+  [[ $rate =~ ^[0-9]+r/[sm]$ ]] || die "Неверный формат rate (пример: 5r/s или 30r/m)."
+  [[ $burst =~ ^[0-9]{1,3}$ && $conn =~ ^[0-9]{1,3}$ ]] || die "burst и limit_conn должны быть целыми числами."
+  sec_nginx_ensure_hooks
+  [[ -f $SEC_NGX_ZONES ]] && { bak_z=$(mktemp); cp -p "$SEC_NGX_ZONES" "$bak_z"; }
+  [[ -f $SEC_NGX_LIM_DIR/10-limit.conf ]] && { bak_l=$(mktemp); cp -p "$SEC_NGX_LIM_DIR/10-limit.conf" "$bak_l"; }
+  cat >"$SEC_NGX_ZONES" <<EOF
+# WAGA: зоны ограничения частоты запросов и одновременных соединений (127.0.0.1 исключён для waga check)
+geo \$waga_limit_exempt {
+    default 0;
+    127.0.0.1/32 1;
+    ::1/128 1;
+}
+map \$waga_limit_exempt \$waga_limit_key {
+    0 \$binary_remote_addr;
+    1 "";
+}
+limit_req_zone \$waga_limit_key zone=waga_req:10m rate=${rate};
+limit_conn_zone \$waga_limit_key zone=waga_conn:10m;
+limit_req_status 429;
+limit_conn_status 429;
+EOF
+  cat >"$SEC_NGX_LIM_DIR/10-limit.conf" <<EOF
+# WAGA: защита панели 3X-UI и подписки waga-sub от брутфорса и флуда
+limit_req zone=waga_req burst=${burst} nodelay;
+limit_conn waga_conn ${conn};
+EOF
+  if nginx -t >/dev/null 2>&1 && systemctl reload nginx; then
+    [[ -n $bak_z ]] && rm -f "$bak_z"; [[ -n $bak_l ]] && rm -f "$bak_l"
+    say "Rate limiting в Nginx включён (rate=${rate}, burst=${burst}, limit_conn=${conn})."
+  else
+    [[ -n $bak_z ]] && cat "$bak_z" >"$SEC_NGX_ZONES" || rm -f "$SEC_NGX_ZONES"
+    [[ -n $bak_l ]] && cat "$bak_l" >"$SEC_NGX_LIM_DIR/10-limit.conf" || rm -f "$SEC_NGX_LIM_DIR/10-limit.conf"
+    [[ -n $bak_z ]] && rm -f "$bak_z"; [[ -n $bak_l ]] && rm -f "$bak_l"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
+    die "nginx не принял конфигурацию rate limiting – всё возвращено как было."
+  fi
+}
+
+sec_ratelimit_off() {
+  rm -f "$SEC_NGX_ZONES" "$SEC_NGX_LIM_DIR/10-limit.conf"
+  if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx >/dev/null 2>&1 || true
+  fi
+  say "Rate limiting в Nginx выключен."
+}
+
+# --- 6. 2FA (TOTP) в панели 3X-UI ---
+
+sec_2fa_status() {
+  local en
+  en=$(api POST setting/all '{}' 2>/dev/null | jq -r '.twoFactorEnable // false' 2>/dev/null || echo "?")
+  if [[ $en == true ]]; then
+    printf '%s\n' "${G}✅${N} 2FA (TOTP) в панели 3X-UI: включена"
+  else
+    printf '%s\n' "${D}ℹ ${N} 2FA (TOTP) в панели 3X-UI: выключена"
+  fi
+}
+
+sec_totp_verify() { # secret code
+  python3 - "$1" "$2" <<'PY'
+import base64, hashlib, hmac, struct, sys, time
+secret = sys.argv[1].strip().upper()
+code = sys.argv[2].strip()
+if not (len(code) == 6 and code.isdigit()):
+    sys.exit(1)
+pad = "=" * (-len(secret) % 8)
+key = base64.b32decode(secret + pad)
+now = int(time.time()) // 30
+for step in (now - 1, now, now + 1):
+    msg = struct.pack(">Q", step)
+    dig = hmac.new(key, msg, hashlib.sha1).digest()
+    off = dig[-1] & 0x0F
+    val = (struct.unpack(">I", dig[off:off+4])[0] & 0x7FFFFFFF) % 1000000
+    if f"{val:06d}" == code:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+sec_2fa_on() {
+  local all en secret uri enc_user code
+  all=$(api POST setting/all '{}')
+  en=$(jq -r '.twoFactorEnable // false' <<<"$all")
+  if [[ $en == true ]]; then
+    say "2FA (TOTP) уже включена в панели 3X-UI."
+    return 0
+  fi
+  secret=$(python3 -c 'import base64, secrets; print(base64.b32encode(secrets.token_bytes(20)).decode().rstrip("="))')
+  enc_user=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${XUI_USERNAME:-admin}")
+  uri="otpauth://totp/WAGA:${enc_user}?secret=${secret}&issuer=WAGA-VPN&algorithm=SHA1&digits=6&period=30"
+  echo
+  echo "${B}Настройка 2FA (TOTP) для панели 3X-UI${N}"
+  echo "Отсканируйте QR-код в Google Authenticator / Bitwarden / 2FAS или введите ключ вручную:"
+  echo
+  echo "  Секретный ключ (Base32): ${B}${secret}${N}"
+  echo
+  command -v qrencode >/dev/null && qrencode -t ANSIUTF8 -m 1 "$uri"
+  echo
+  if [[ -t 0 && -t 1 ]]; then
+    while :; do
+      ask_tty "Введите 6-значный код из приложения для проверки (или 'q' – отмена): "
+      code=${REPLY//[[:space:]]/}
+      [[ ${code,,} == q || ${code,,} == й ]] && { echo "Отменено, 2FA не включена."; return 0; }
+      if sec_totp_verify "$secret" "$code"; then
+        break
+      fi
+      warn "Код не совпал. Проверьте точное время на телефоне/сервере и введите текущий код ещё раз."
+    done
+  fi
+  api POST setting/update "$(jq -c --arg t "$secret" '.twoFactorEnable = true | .twoFactorToken = $t' <<<"$all")" >/dev/null \
+    || die "Панель не приняла настройку 2FA."
+  say "2FA (TOTP) включена в панели 3X-UI! Сохраните ключ ${B}${secret}${N} в надёжном месте."
+  echo "  Аварийное отключение (если потеряли телефон): waga → Защита и оптимизация сервера → 2FA → Выключить."
+}
+
+sec_2fa_off() {
+  local all
+  all=$(api POST setting/all '{}')
+  api POST setting/update "$(jq -c '.twoFactorEnable = false | .twoFactorToken = ""' <<<"$all")" >/dev/null \
+    || die "Не удалось выключить 2FA в панели."
+  say "2FA (TOTP) в панели 3X-UI выключена."
+}
+
+# --- 7. Жёсткие заголовки и сброс 444 в Nginx ---
+
+sec_headers_status() {
+  if [[ -f $SEC_NGX_DIR/20-hardening.conf ]]; then
+    local hosts
+    hosts=$(sed -n 's/.*\$host = "\([^"]*\)".*/\1/p' "$SEC_NGX_DIR/20-hardening.conf" | paste -sd, -)
+    printf '%s\n' "${G}✅${N} Жёсткие заголовки и сброс 444 в Nginx: включены (разрешены методы GET/POST/HEAD; Host: ${hosts:-любой})"
+  else
+    printf '%s\n' "${D}ℹ ${N} Жёсткие заголовки и сброс 444 в Nginx: выключены"
+  fi
+}
+
+sec_headers_on() { # [strict|ip-ok]
+  local mode=${1:-auto} domain="" bak=""
+  local -a allowed=()
+  [[ ${SINGLE:-no} == yes && -f $PANEL_CONF ]] || die "Эта настройка работает в режиме «всё на 443» с nginx."
+  sec_nginx_ensure_hooks
+  domain=$(panel_conf_py info "$PANEL_CONF" 2>/dev/null | awk '{print $1}' || true)
+  if [[ $mode == auto ]]; then
+    if [[ ${PANEL_ON:-ip} == domain && -n $domain ]]; then
+      mode=strict
+    else
+      mode=ip-ok
+    fi
+  fi
+  if [[ $mode == strict && -n $domain ]]; then
+    allowed+=("$domain")
+  else
+    [[ -n $domain ]] && allowed+=("$domain")
+    [[ -n ${HOST:-} ]] && allowed+=("$HOST")
+  fi
+  [[ -f $SEC_NGX_DIR/20-hardening.conf ]] && { bak=$(mktemp); cp -p "$SEC_NGX_DIR/20-hardening.conf" "$bak"; }
+  {
+    echo "# WAGA: жёсткие заголовки безопасности, запрет лишних HTTP-методов и тихий сброс 444"
+    echo 'add_header X-Content-Type-Options "nosniff" always;'
+    echo 'add_header X-Frame-Options "SAMEORIGIN" always;'
+    echo 'add_header Referrer-Policy "no-referrer" always;'
+    echo 'add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;'
+    echo ""
+    echo "# Тихий сброс (444) для любых методов кроме GET, POST, HEAD"
+    echo 'if ($request_method !~ ^(GET|POST|HEAD)$) {'
+    echo "    return 444;"
+    echo "}"
+    if ((${#allowed[@]})); then
+      echo ""
+      echo "# Тихий сброс (444) при прямом заходе по IP / чужом Host (локальные проверки 127.0.0.1 разрешены)"
+      echo 'set $waga_host_ok 0;'
+      echo 'if ($remote_addr = 127.0.0.1) { set $waga_host_ok 1; }'
+      echo 'if ($remote_addr = ::1) { set $waga_host_ok 1; }'
+      local h
+      for h in "${allowed[@]}"; do
+        echo "if (\$host = \"$h\") { set \$waga_host_ok 1; }"
+      done
+      echo 'if ($waga_host_ok = 0) {'
+      echo "    return 444;"
+      echo "}"
+    fi
+  } >"$SEC_NGX_DIR/20-hardening.conf"
+  sec_nginx_reload_or_rollback "$SEC_NGX_DIR/20-hardening.conf" "$bak" || die "Не удалось применить заголовки и сброс 444 в nginx."
+  say "Жёсткие заголовки, запрет лишних методов и сброс 444 включены."
+  echo "   Разрешённые Host: ${allowed[*]:-не ограничены} (прямые запросы с другим Host/IP получают 444)."
+  if [[ $mode != strict && -z $domain ]]; then
+    echo "   ${D}Подсказка: сервер работает без своего домена, поэтому доступ по IP ${HOST:-?} оставлен разрешённым, чтобы не заблокировать панель.${N}"
+  fi
+}
+
+sec_headers_off() {
+  rm -f "$SEC_NGX_DIR/20-hardening.conf"
+  if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx >/dev/null 2>&1 || true
+  fi
+  say "Жёсткие заголовки и сброс 444 в Nginx выключены."
+}
+
+
+# --- 8. SSH-туннель между двумя VPS со сменой портов (без VPN / tun) ---
+
+SEC_TUN_DIR=/etc/waga/tunnels
+
+sec_tun_list() {
+  local f name mode lp rip rport st
+  echo "${B}Активные SSH-туннели WAGA (без VPN/tun):${N}"
+  if [[ ! -d $SEC_TUN_DIR ]] || ! ls "$SEC_TUN_DIR"/*.env >/dev/null 2>&1; then
+    echo "  (туннелей нет)"
+    return 0
+  fi
+  for f in "$SEC_TUN_DIR"/*.env; do
+    name=$(basename "$f" .env)
+    mode=$(awk -F= '/^TUN_MODE=/{gsub(/"/,"",$2);print $2}' "$f")
+    lp=$(awk -F= '/^TUN_LOCAL_PORT=/{gsub(/"/,"",$2);print $2}' "$f")
+    rip=$(awk -F= '/^TUN_REMOTE_HOST=/{gsub(/"/,"",$2);print $2}' "$f")
+    rport=$(awk -F= '/^TUN_REMOTE_PORT=/{gsub(/"/,"",$2);print $2}' "$f")
+    if systemctl is-active -q "waga-tun-${name}.service" 2>/dev/null; then st="${G}работает${N}"; else st="${R}остановлен${N}"; fi
+    if [[ $mode == relay ]]; then
+      echo -e "  • ${B}$name${N} [TCP-проброс] :${lp} → ${rip}:${rport}  ($st)"
+      echo "    Подключение с ПК без VPN: ssh -p ${lp} root@${HOST:-IP_ЭТОГО_VPS}"
+    else
+      echo -e "  • ${B}$name${N} [Обратный SSH] этот VPS:${lp} ← ${rip}:${rport}  ($st)"
+      echo "    Подключение с ПК без VPN: ssh -p ${rport} root@${rip}"
+    fi
+  done
+}
+
+sec_tun_add_relay() { # имя лок_порт целевой_ip целевой_ssh_порт
+  local name=${1:-} lp=${2:-} rip=${3:-} rport=${4:-22}
+  [[ $name =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die "Имя туннеля: латиница, цифры, _ и -."
+  [[ $lp =~ ^[0-9]{1,5}$ && $rport =~ ^[0-9]{1,5}$ ]] || die "Порты должны быть числами (1024-65535)."
+  ((10#$lp >= 1024 && 10#$lp <= 65535)) || die "Локальный порт должен быть от 1024 до 65535."
+  [[ $rip =~ ^[A-Za-z0-9.:-]+$ ]] || die "Неверный IP или домен целевого VPS: $rip"
+  command -v socat >/dev/null 2>&1 || { DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y -qq socat >/dev/null || die "Не удалось установить socat."; }
+  install -d -m 700 "$SEC_TUN_DIR"
+  cat >"$SEC_TUN_DIR/${name}.env" <<EOF
+TUN_MODE="relay"
+TUN_LOCAL_PORT="${lp}"
+TUN_REMOTE_HOST="${rip}"
+TUN_REMOTE_PORT="${rport}"
+EOF
+  chmod 600 "$SEC_TUN_DIR/${name}.env"
+  cat >"/etc/systemd/system/waga-tun-${name}.service" <<UNIT
+[Unit]
+Description=WAGA SSH TCP Relay ($name: :$lp -> $rip:$rport)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP-LISTEN:${lp},fork,reuseaddr TCP:${rip}:${rport}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now "waga-tun-${name}.service" || die "Не удалось запустить waga-tun-${name}.service"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw limit "${lp}/tcp" >/dev/null 2>&1 || ufw allow "${lp}/tcp" >/dev/null 2>&1 || true
+  fi
+  say "TCP-проброс «$name» запущен: порт ${lp}/tcp на этом VPS → ${rip}:${rport}."
+  echo "  Вход на целевой VPS с ПК без VPN: ${B}ssh -p ${lp} root@${HOST:-IP_ЭТОГО_VPS}${N}"
+}
+
+sec_tun_add_reverse() { # имя удалённый_vps удалённый_ssh_порт удалённый_порт_входа лок_ssh_порт
+  local name=${1:-} rip=${2:-} rssh=${3:-22} rport=${4:-2222} lport=${5:-22} key=/root/.ssh/waga_tun_ed25519
+  [[ $name =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die "Имя туннеля: латиница, цифры, _ и -."
+  [[ $rip =~ ^[A-Za-z0-9.:-]+$ ]] || die "Неверный IP или домен второго VPS."
+  [[ $rssh =~ ^[0-9]{1,5}$ && $rport =~ ^[0-9]{1,5}$ && $lport =~ ^[0-9]{1,5}$ ]] || die "Порты должны быть числами."
+  install -d -m 700 /root/.ssh "$SEC_TUN_DIR"
+  if [[ ! -f $key ]]; then
+    ssh-keygen -t ed25519 -N "" -f "$key" -C "waga-tunnel" >/dev/null
+  fi
+  echo
+  echo "${B}Шаг 1 (выполните ОДИН раз на втором VPS ${rip}):${N}"
+  echo "  1) Добавьте этот ключ в /root/.ssh/authorized_keys на ${rip}:"
+  echo "     ${G}$(cat "${key}.pub")${N}"
+  echo "  2) Разрешите внешний порт в /etc/ssh/sshd_config на ${rip} и откройте порт ${rport}:"
+  echo "     ${D}grep -q '^GatewayPorts yes' /etc/ssh/sshd_config || echo 'GatewayPorts yes' >> /etc/ssh/sshd_config && systemctl reload ssh || systemctl reload sshd${N}"
+  echo "     ${D}ufw limit ${rport}/tcp${N}"
+  echo
+  if [[ -t 0 && -t 1 ]]; then
+    ask_tty "Готово на втором VPS? Enter – запустить туннель (или 'q' – отмена): "
+    [[ ${REPLY,,} == q || ${REPLY,,} == й ]] && { echo "Отменено."; return 0; }
+  fi
+  cat >"$SEC_TUN_DIR/${name}.env" <<EOF
+TUN_MODE="reverse"
+TUN_LOCAL_PORT="${lport}"
+TUN_REMOTE_HOST="${rip}"
+TUN_REMOTE_PORT="${rport}"
+TUN_REMOTE_SSH="${rssh}"
+EOF
+  chmod 600 "$SEC_TUN_DIR/${name}.env"
+  cat >"/etc/systemd/system/waga-tun-${name}.service" <<UNIT
+[Unit]
+Description=WAGA Reverse SSH Tunnel ($name: $rip:$rport -> 127.0.0.1:$lport)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -NT -i ${key} -p ${rssh} -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -R 0.0.0.0:${rport}:127.0.0.1:${lport} root@${rip}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now "waga-tun-${name}.service" || die "Не удалось запустить waga-tun-${name}.service"
+  say "Обратный SSH-туннель «$name» запущен."
+  echo "  Вход на ЭТОТ сервер через второй VPS без VPN: ${B}ssh -p ${rport} root@${rip}${N}"
+}
+
+sec_tun_del() { # имя
+  local name=${1:-} lp="" mode=""
+  [[ $name =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die "Укажите имя туннеля."
+  if [[ -f $SEC_TUN_DIR/${name}.env ]]; then
+    mode=$(awk -F= '/^TUN_MODE=/{gsub(/"/,"",$2);print $2}' "$SEC_TUN_DIR/${name}.env")
+    lp=$(awk -F= '/^TUN_LOCAL_PORT=/{gsub(/"/,"",$2);print $2}' "$SEC_TUN_DIR/${name}.env")
+  fi
+  systemctl disable --now "waga-tun-${name}.service" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/waga-tun-${name}.service" "$SEC_TUN_DIR/${name}.env"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ $mode == relay && -n $lp ]] && command -v ufw >/dev/null 2>&1; then
+    ufw delete limit "${lp}/tcp" >/dev/null 2>&1 || true
+    ufw delete allow "${lp}/tcp" >/dev/null 2>&1 || true
+  fi
+  say "Туннель «$name» удалён."
+}
+
+s_tunnel() {
+  sec_tun_list
+  echo
+  echo "  1. Создать TCP-проброс SSH на другой VPS (Relay: порт этого VPS → IP:порт второго VPS)"
+  echo "  2. Создать обратный SSH-туннель через другой VPS (Reverse: этот VPS → второй VPS)"
+  echo "  3. Удалить туннель"
+  echo "  0. Назад"
+  ask_num "Выбор [0-3]: "
+  case $REPLY in
+    1)
+      local nm lp rip rp
+      ask_tty "Имя туннеля (напр. vps2): "; nm=${REPLY//[[:space:]]/}
+      ask_tty "Порт на ЭТОМ VPS (напр. 2222): "; lp=${REPLY//[[:space:]]/}
+      ask_tty "IP или домен второго VPS: "; rip=${REPLY//[[:space:]]/}
+      ask_tty "SSH-порт второго VPS [22]: "; rp=${REPLY:-22}
+      sec_tun_add_relay "$nm" "$lp" "$rip" "$rp" ;;
+    2)
+      local nm rip rssh rport lport
+      ask_tty "Имя туннеля (напр. via-vps1): "; nm=${REPLY//[[:space:]]/}
+      ask_tty "IP или домен доступного VPS: "; rip=${REPLY//[[:space:]]/}
+      ask_tty "SSH-порт доступного VPS [22]: "; rssh=${REPLY:-22}
+      ask_tty "Порт входа на доступном VPS [2222]: "; rport=${REPLY:-2222}
+      ask_tty "Локальный SSH-порт ЭТОГО VPS [22]: "; lport=${REPLY:-22}
+      sec_tun_add_reverse "$nm" "$rip" "$rssh" "$rport" "$lport" ;;
+    3)
+      ask_tty "Имя туннеля для удаления: "
+      [[ -n ${REPLY//[[:space:]]/} ]] && sec_tun_del "${REPLY//[[:space:]]/}" ;;
+  esac
+}
+
+# --- Общий статус и интерактивные подменю защиты ---
+
+sec_status() {
+  echo "${B}Статус модулей защиты и оптимизации WAGA${N}"
+  echo
+  sec_f2b_status
+  sec_sysctl_status
+  sec_updates_status
+  sec_domain_status
+  sec_ratelimit_status
+  sec_2fa_status
+  sec_headers_status
+}
+
+s_fail2ban() {
+  sec_f2b_status
+  echo
+  echo "  1. Установить / включить Fail2ban (sshd + nginx + защита от самобана)"
+  echo "  2. Добавить IP или подсеть в белый список (ignoreip)"
+  echo "  3. Удалить IP или подсеть из белого списка (ignoreip)"
+  echo "  4. Разбанить IP (или снять все баны)"
+  echo "  5. Выключить правила Fail2ban от WAGA"
+  echo "  0. Назад"
+  ask_num "Выбор [0-5]: "
+  case $REPLY in
+    1) sec_f2b_on ;;
+    2) ask_tty "IP или подсеть (напр. 109.252.0.0/16, можно через пробел): "; [[ -n ${REPLY//[[:space:]]/} ]] && sec_f2b_ignoreip_add "$REPLY" ;;
+    3) ask_tty "IP или подсеть для удаления: "; [[ -n ${REPLY//[[:space:]]/} ]] && sec_f2b_ignoreip_del "${REPLY//[[:space:]]/}" ;;
+    4) ask_tty "IP для разбана (Enter – разбанить всех): "; sec_f2b_unban "${REPLY//[[:space:]]/}" ;;
+    5) sec_f2b_off ;;
+  esac
+}
+
+s_sysctl() {
+  sec_sysctl_status
+  echo
+  ask_num "1 – включить (BBR + UDP 16МБ + SYN/rp_filter), 2 – выключить, Enter – назад: "
+  case $REPLY in 1) sec_sysctl_on ;; 2) sec_sysctl_off ;; esac
+}
+
+s_updates() {
+  sec_updates_status
+  echo
+  ask_num "1 – включить (только security-патчи, без перезагрузки), 2 – выключить, Enter – назад: "
+  case $REPLY in 1) sec_updates_on ;; 2) sec_updates_off ;; esac
+}
+
+s_domain() {
+  sec_domain_status
+  echo
+  echo "  1. Автообновление DuckDNS (домен + токен, каждые 5 мин)"
+  echo "  2. Автообновление по своему DDNS URL (https://…)"
+  echo "  3. Проверить и продлить TLS-сертификат домена (acme.sh)"
+  echo "  4. Выключить автообновление домена (DDNS)"
+  echo "  0. Назад"
+  ask_num "Выбор [0-4]: "
+  case $REPLY in
+    1)
+      local def_dom="" dom tok
+      [[ ${LINK_HOST:-} == *.duckdns.org ]] && def_dom=${LINK_HOST%.duckdns.org}
+      if [[ -n $def_dom ]]; then ask_tty "Поддомен DuckDNS [$def_dom]: "; dom=${REPLY:-$def_dom}
+      else ask_tty "Поддомен DuckDNS (напр. auranode): "; dom=$REPLY; fi
+      ask_tty "Токен DuckDNS: "; tok=$REPLY
+      [[ -n ${dom//[[:space:]]/} && -n ${tok//[[:space:]]/} ]] && sec_ddns_duckdns "$dom" "$tok" ;;
+    2) ask_tty "HTTPS URL для обновления DDNS (можно {IP}): "; [[ -n ${REPLY//[[:space:]]/} ]] && sec_ddns_url "$REPLY" ;;
+    3) sec_domain_tls_renew ;;
+    4) sec_ddns_off ;;
+  esac
+}
+
+s_ratelimit() {
+  sec_ratelimit_status
+  echo
+  ask_num "1 – включить (5r/s, burst=10, conn=20), 2 – включить со своими числами, 3 – выключить, Enter – назад: "
+  case $REPLY in
+    1) sec_ratelimit_on 5r/s 10 20 ;;
+    2)
+      local r b c
+      ask_tty "Лимит запросов [5r/s]: "; r=${REPLY:-5r/s}
+      ask_tty "Burst [10]: "; b=${REPLY:-10}
+      ask_tty "Максимум соединений с 1 IP [20]: "; c=${REPLY:-20}
+      sec_ratelimit_on "$r" "$b" "$c" ;;
+    3) sec_ratelimit_off ;;
+  esac
+}
+
+s_2fa() {
+  sec_2fa_status
+  echo
+  ask_num "1 – включить 2FA (с QR-кодом и проверкой), 2 – выключить 2FA, Enter – назад: "
+  case $REPLY in 1) sec_2fa_on ;; 2) sec_2fa_off ;; esac
+}
+
+s_headers() {
+  sec_headers_status
+  echo
+  ask_num "1 – включить (заголовки + GET/POST/HEAD + сброс 444), 2 – выключить, Enter – назад: "
+  case $REPLY in 1) sec_headers_on auto ;; 2) sec_headers_off ;; esac
+}
+
+s_recommended() {
+  echo "${B}Рекомендуемый пакет защиты и оптимизации:${N}"
+  echo "  • Тюнинг ядра sysctl (BBR + fq + UDP 16 МБ + анти-спуфинг / SYN-cookies)"
+  echo "  • Автообновления безопасности ОС (unattended-upgrades, без перезагрузки)"
+  echo "  • Fail2ban (sshd + nginx + ваш текущий SSH IP в ignoreip)"
+  if [[ ${SINGLE:-no} == yes && -f $PANEL_CONF ]]; then
+    echo "  • Rate limiting в Nginx (5r/s, burst=10, limit_conn=20)"
+    echo "  • Жёсткие заголовки, запрет лишних методов и сброс 444 в Nginx"
+  fi
+  echo
+  ask_tty "Установить всё из списка выше? [Y/n] "
+  [[ ${REPLY,,} == n* || ${REPLY,,} == н* ]] && { echo "Отменено."; return 0; }
+  sec_sysctl_on
+  sec_updates_on
+  sec_f2b_on
+  if [[ ${SINGLE:-no} == yes && -f $PANEL_CONF ]]; then
+    sec_ratelimit_on 5r/s 10 20
+    sec_headers_on auto
+  fi
+  echo
+  say "Рекомендуемый пакет установлен! Дополнительно в меню доступны:"
+  echo "  • Пункт 5 – Автообновление домена (DuckDNS / DDNS + TLS)"
+  echo "  • Пункт 7 – 2FA (TOTP) для входа в панель 3X-UI"
+}
+
+cmd_sec() {
+  local sub=${1:-}
+  [[ -z $sub ]] || shift
+  case ${sub,,} in
+    "") if [[ -t 0 && -t 1 ]]; then menu_sec; else sec_status; fi ;;
+    status) sec_status ;;
+    fail2ban | f2b)
+      case ${1:-status} in
+        on) shift; sec_f2b_on "$*" ;;
+        off) sec_f2b_off ;;
+        status) sec_f2b_status ;;
+        ignoreip)
+          case ${2:-list} in
+            add) shift 2; sec_f2b_ignoreip_add "$*" ;;
+            del) shift 2; sec_f2b_ignoreip_del "${1:-}" ;;
+            list) echo "ignoreip: $(sec_f2b_get_ignoreip)" ;;
+            *) die "waga sec fail2ban ignoreip [list | add IP | del IP]" ;;
+          esac ;;
+        unban) sec_f2b_unban "${2:---all}" ;;
+        *) die "waga sec fail2ban [on [IP] | off | status | ignoreip ... | unban [IP|--all]]" ;;
+      esac ;;
+    sysctl)
+      case ${1:-status} in on) sec_sysctl_on ;; off) sec_sysctl_off ;; status) sec_sysctl_status ;; *) die "waga sec sysctl [on|off|status]" ;; esac ;;
+    updates)
+      case ${1:-status} in on) sec_updates_on ;; off) sec_updates_off ;; status) sec_updates_status ;; *) die "waga sec updates [on|off|status]" ;; esac ;;
+    domain | ddns)
+      case ${1:-status} in
+        duckdns) sec_ddns_duckdns "${2:-}" "${3:-}" ;;
+        url) sec_ddns_url "${2:-}" ;;
+        tls) sec_domain_tls_renew ;;
+        off) sec_ddns_off ;;
+        status) sec_domain_status ;;
+        *) die "waga sec domain [duckdns ДОМЕН ТОКЕН | url HTTPS_URL | tls | off | status]" ;;
+      esac ;;
+    ratelimit)
+      case ${1:-status} in on) sec_ratelimit_on "${2:-5r/s}" "${3:-10}" "${4:-20}" ;; off) sec_ratelimit_off ;; status) sec_ratelimit_status ;; *) die "waga sec ratelimit [on [rate] [burst] [conn] | off | status]" ;; esac ;;
+    2fa | totp)
+      case ${1:-status} in on) sec_2fa_on ;; off) sec_2fa_off ;; status) sec_2fa_status ;; *) die "waga sec 2fa [on|off|status]" ;; esac ;;
+    headers)
+      case ${1:-status} in on) sec_headers_on "${2:-auto}" ;; off) sec_headers_off ;; status) sec_headers_status ;; *) die "waga sec headers [on [strict|ip-ok] | off | status]" ;; esac ;;
+    tunnel)
+      case ${1:-list} in relay) shift; sec_tun_add_relay "$@" ;; reverse) shift; sec_tun_add_reverse "$@" ;; del) sec_tun_del "${2:-}" ;; *) sec_tun_list ;; esac ;;
+    *) die "waga sec [status | fail2ban | sysctl | updates | domain | ratelimit | 2fa | headers]" ;;
+  esac
+}
+
+menu_sec() {
+  local c
+  while :; do
+    echo
+    box "Защита и оптимизация сервера" \
+      "1. Статус всех модулей защиты" \
+      "2. Fail2ban (sshd + nginx + ignoreip)" \
+      "3. Тюнинг ядра sysctl (BBR + UDP + защита)" \
+      "4. Автообновления безопасности ОС" \
+      "5. Автообновление домена (DDNS + TLS)" \
+      "6. Rate limiting в Nginx (панель/подписка)" \
+      "7. 2FA (TOTP) в панели 3X-UI" \
+      "8. Жёсткие заголовки и сброс 444 в Nginx" \
+      "9. SSH-туннель между VPS (обход блокировки IP)" "" \
+      "10. Установить рекомендуемый пакет разом" \
+      "0. Назад"
+    ask_num "Выбор [0-10]: "; c=$REPLY
+    case $c in
+      1) run_action sec_status; pause ;;
+      2) run_action s_fail2ban; pause ;;
+      3) run_action s_sysctl; pause ;;
+      4) run_action s_updates; pause ;;
+      5) run_action s_domain; pause ;;
+      6) run_action s_ratelimit; pause ;;
+      7) run_action s_2fa; pause ;;
+      8) run_action s_headers; pause ;;
+      9) run_action s_tunnel; pause ;;
+      10) run_action s_recommended; pause ;;
+      0 | "") return 0 ;;
+      *) echo "Нет такого пункта." ;;
+    esac
+  done
+}
+
 menu_main() {
   local c
   while :; do
     echo
-    box "WAGA · Дядя Вова VPN $WAGA_VERSION – управление сервером" "1. Пользователи" "2. Протоколы, порты и маскировка" "3. Проверка сервера" "" \
-      "4. Обновить waga и подписку" "5. Обновить панель 3X-UI" "6. Автообновление: включить или выключить" "" \
-      "7. Резервная копия" "8. Версии" "" "9. Панель 3X-UI (меню x-ui)" "10. Удалить WAGA с сервера" "0. Выход"
+    box "WAGA · Дядя Вова VPN $WAGA_VERSION – управление сервером" "1. Пользователи" "2. Протоколы, порты и маскировка" "3. Проверка сервера" "4. Защита и оптимизация сервера" "" \
+      "5. Обновить waga и подписку" "6. Обновить панель 3X-UI" "7. Автообновление: включить или выключить" "" \
+      "8. Резервная копия" "9. Версии" "" "10. Панель 3X-UI (меню x-ui)" "11. Удалить WAGA с сервера" "0. Выход"
     echo
     menu_status
     update_hint
     echo
-    ask_num "Выбор [0-10]: "; c=$REPLY
+    ask_num "Выбор [0-11]: "; c=$REPLY
     case $c in
       1) menu_users ;;
       2) menu_net ;;
       3) menu_check ;;
-      4) run_action cmd_update; pause ;;
-      5) run_action panel_update; pause ;;
-      6) run_action menu_auto; pause ;;
-      7) run_action cmd_backup; pause ;;
-      8) run_action cmd_version; pause ;;
-      9) command -v x-ui >/dev/null && x-ui || echo "Меню x-ui не найдено." ;;
-      10) run_action cmd_uninstall; pause ;;
+      4) menu_sec ;;
+      5) run_action cmd_update; pause ;;
+      6) run_action panel_update; pause ;;
+      7) run_action menu_auto; pause ;;
+      8) run_action cmd_backup; pause ;;
+      9) run_action cmd_version; pause ;;
+      10) command -v x-ui >/dev/null && x-ui || echo "Меню x-ui не найдено." ;;
+      11) run_action cmd_uninstall; pause ;;
       0 | "") return 0 ;;
       *) echo "Нет такого пункта." ;;
     esac
@@ -3385,12 +4824,16 @@ cmd_uninstall() { # [--yes] [--no-backup] [--dry-run]
       *) die "waga uninstall [--yes] [--no-backup] [--dry-run]" ;;
     esac
   done
-  local -a units=(x-ui waga-sub waga-limit.timer waga-limit.service waga-update.timer waga-update.service)
+  local -a units=(x-ui waga-sub waga-limit.timer waga-limit.service waga-update.timer waga-update.service waga-ddns.timer waga-ddns.service)
   local -a paths=(/usr/local/x-ui /etc/x-ui /var/log/x-ui /usr/local/lib/waga-sub /etc/waga-sub /etc/waga /var/www/waga
     /etc/nginx/waga-stream.conf /etc/nginx/conf.d/waga.conf /etc/cron.d/waga-xui-menu /etc/cron.d/waga-sub-cert /etc/cron.d/waga-nginx-reload
     /root/cert/ip /root/cert/custom /root/cert/self /root/cert/domain /root/waga.txt /usr/bin/x-ui
     /etc/fail2ban/jail.d/3x-ipl.conf /etc/fail2ban/jail.d/3x-ipl-backend.conf /etc/fail2ban/filter.d/3x-ipl.conf /etc/fail2ban/action.d/3x-ipl.conf
-    /var/log/3x-ui-install.log /var/log/waga-install-check.log /var/log/waga-domain-cert.log /var/log/waga-update.log)
+    /var/log/3x-ui-install.log /var/log/waga-install-check.log /var/log/waga-domain-cert.log /var/log/waga-update.log
+    /etc/sysctl.d/99-waga-security.conf /etc/apt/apt.conf.d/51waga-security-upgrades
+    /etc/fail2ban/jail.d/waga.local /etc/fail2ban/filter.d/waga-nginx-scan.conf /etc/fail2ban/filter.d/waga-nginx-limit.conf
+    /etc/nginx/conf.d/00-waga-sec-zones.conf /etc/nginx/waga-sec.d /etc/nginx/waga-limit.d /etc/logrotate.d/waga-nginx /var/log/nginx/waga-sec.log
+    /usr/local/lib/waga)
   local -a ports=()
   mapfile -t ports < <(uninstall_ports)
 
@@ -3426,6 +4869,7 @@ cmd_uninstall() { # [--yes] [--no-backup] [--dry-run]
   say "Останавливаю сервисы"
   for u in "${units[@]}"; do systemctl disable --now "$u" >/dev/null 2>&1 || true; done
   pkill -f '/usr/local/x-ui/' >/dev/null 2>&1 || true
+  for u in /etc/systemd/system/waga-tun-*.service; do [[ -f $u ]] && systemctl disable --now "$(basename "$u")" >/dev/null 2>&1 || true; done
   rm -f /etc/systemd/system/x-ui.service /etc/systemd/system/waga-*.service /etc/systemd/system/waga-*.timer
   systemctl daemon-reload >/dev/null 2>&1 || true
 
@@ -3442,7 +4886,8 @@ cmd_uninstall() { # [--yes] [--no-backup] [--dry-run]
 
   say "Убираю nginx от WAGA"
   sed -i '/waga-stream\.conf/d' /etc/nginx/nginx.conf 2>/dev/null || true
-  rm -f /etc/nginx/waga-stream.conf /etc/nginx/conf.d/waga.conf
+  rm -f /etc/nginx/waga-stream.conf /etc/nginx/conf.d/waga.conf /etc/nginx/conf.d/00-waga-sec-zones.conf
+  rm -rf /etc/nginx/waga-sec.d /etc/nginx/waga-limit.d
   if command -v nginx >/dev/null 2>&1; then
     if [[ -z $(find /etc/nginx/conf.d -mindepth 1 -name '*.conf' 2>/dev/null) && -z $(find /etc/nginx/sites-enabled -mindepth 1 ! -name default 2>/dev/null) ]]; then
       systemctl disable --now nginx >/dev/null 2>&1 || true
@@ -3493,6 +4938,7 @@ ${B}WAGA · Дядя Вова VPN $WAGA_VERSION${N} – команды (то ж�
   waga links [имя]            все ссылки на подключения (подписка, протоколы, Telegram)
   waga net …                  протоколы, порты, сайт маскировки, отпечаток
   waga check [--deep|--fix]   проверка сервера
+  waga sec …                  защита и оптимизация (fail2ban, sysctl, updates, domain, ratelimit, 2fa, headers)
   waga update [--panel]       обновление (--auto и --manual – автообновление)
   waga backup                 копия сервера
   waga uninstall              полное удаление (спросит подтверждение; --dry-run – только показать)
@@ -3512,6 +4958,7 @@ case "$cmd_key" in
   "user off") cmd_toggle "${3:-}" false ;;
   "user on") cmd_toggle "${3:-}" true ;;
   "user del") shift 2; cmd_del "$@" ;;
+  "user import") shift 2; cmd_import "$@" ;;
   "user enforce") shift 2; cmd_enforce "$@" ;;
   "user vision") shift 2; cmd_vision "$@" ;;
   "net ") shift; cmd_net; update_hint ;;
@@ -3540,6 +4987,8 @@ case "$cmd_key" in
   "update "*) shift; cmd_update "$@" ;;
   "backup "*) cmd_backup ;;
   "uninstall"*) shift; cmd_uninstall "$@" ;;
+  "sec ") shift; cmd_sec ;;
+  "sec "*) shift; cmd_sec "$@" ;;
   "check "*) shift; cmd_check "$@" ;;
   "fix "*) shift; cmd_fix "$@" ;;
   "version "*|"--version "*|"-v "*) cmd_version ;;
