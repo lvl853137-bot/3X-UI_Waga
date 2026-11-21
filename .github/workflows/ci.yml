@@ -1,0 +1,30 @@
+name: CI (WAGA)
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Синтаксис Bash и ShellCheck
+        run: |
+          bash -n scripts/waga-install.sh scripts/waga.sh
+          shellcheck -S warning -e SC1090,SC2034,SC2211 scripts/*.sh
+      - name: Синтаксис Python (waga-sub)
+        run: python3 -m py_compile scripts/waga-sub.py
+      - name: Проверка доменов GEMINI
+        run: |
+          for d in geosite:google-gemini domain:gemini.google.com domain:aistudio.google.com domain:generativelanguage.googleapis.com domain:alkalimining-pa.googleapis.com domain:proactivebackend-pa.googleapis.com; do
+            grep -qF "$d" scripts/waga.sh
+          done
+      - name: Проверка VERSION
+        run: |
+          v=$(cat VERSION)
+          grep -q "^WAGA_VERSION=\"$v\"" scripts/waga-install.sh
+          grep -q "^WAGA_VERSION=\"$v\"" scripts/waga.sh
