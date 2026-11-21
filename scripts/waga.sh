@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 export LC_ALL=C.UTF-8  # ширина колонок по символам, а не байтам
 
-WAGA_VERSION="1.2.0"
+WAGA_VERSION="1.3.0"
 WAGA_RAW="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main"
 # Файлы новой версии берём из её тега, а не из меняющейся ветки main.
 waga_ref_raw() { echo "https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/v$1"; }
@@ -32,9 +32,9 @@ declare -A XUI_TARBALL_SHA256=(
 XUI_SH_SHA256=d28959cb5da86c8ddaf2199e5c32dd1ea5dc0a87fcc53f900dd39b133070898a
 
 if [[ -t 1 ]]; then
-  G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; B=$'\e[1m'; D=$'\e[2m'; N=$'\e[0m'
+  G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; C=$'\e[36m'; M=$'\e[35m'; B=$'\e[1m'; D=$'\e[2m'; N=$'\e[0m'
 else
-  G=; Y=; R=; B=; D=; N=
+  G=; Y=; R=; C=; M=; B=; D=; N=
 fi
 say()  { printf '%s\n' "${G}==>${N} $*"; }
 warn() { spin_stop; printf '%s\n' "${Y}!${N}  $*" >&2; }
@@ -1597,6 +1597,153 @@ deep_hint() {
     echo "  Подключилось – сервер доступен, смотрите клиент: точное время на телефоне, Hysteria2 вместо TCP-протокола, другое приложение."
     echo "  Не подключилось – трафик из этой сети до сервера не доходит: попробуйте другую сеть или другой адрес сервера."
   fi
+}
+
+
+# ---------- Мониторинг и самочувствие сервера (v1.3.0) ----------
+
+cmd_speedtest() {
+  echo "${B}⚡ Тест скорости канала VPS${N}"
+  echo
+  if command -v speedtest >/dev/null 2>&1; then
+    speedtest --accept-license --accept-gdpr 2>/dev/null || speedtest
+    return 0
+  fi
+  if command -v speedtest-cli >/dev/null 2>&1; then
+    speedtest-cli --simple
+    return 0
+  fi
+  say "Утилита speedtest не найдена — выполняю быстрый замер через Cloudflare (без установки лишних пакетов)..."
+  local ping_ms dl_bps ul_bps dl_mb ul_mb
+  ping_ms=$(curl -4 -o /dev/null -s -w '%{time_connect}' -m 8 https://speed.cloudflare.com/__down?bytes=1 2>/dev/null \
+    | awk '{printf "%.1f", $1 * 1000}' || echo "?")
+  spin_start "Замеряю скорость скачивания (25 МБ)..."
+  dl_bps=$(curl -4 -o /dev/null -s -w '%{speed_download}' -m 25 "https://speed.cloudflare.com/__down?bytes=25000000" 2>/dev/null || echo 0)
+  spin_stop
+  spin_start "Замеряю скорость отдачи (10 МБ)..."
+  ul_bps=$(dd if=/dev/zero bs=1M count=10 2>/dev/null | curl -4 -o /dev/null -s -w '%{speed_upload}' -m 25 --data-binary @- "https://speed.cloudflare.com/__up" 2>/dev/null || echo 0)
+  spin_stop
+  dl_mb=$(awk -v s="${dl_bps:-0}" 'BEGIN{printf "%.1f", (s*8)/1000000}')
+  ul_mb=$(awk -v s="${ul_bps:-0}" 'BEGIN{printf "%.1f", (s*8)/1000000}')
+  echo "  Пинг (TCP):   ${B}${ping_ms} мс${N}"
+  echo "  Скачивание:   ${G}${B}${dl_mb} Мбит/с${N}"
+  echo "  Отдача:       ${C}${B}${ul_mb} Мбит/с${N}"
+  echo "  ${D}(Для официального Ookla Speedtest: apt install speedtest-cli)${N}"
+}
+
+cmd_resources() {
+  echo "${B}📊 Потребление ресурсов сервера${N}"
+  echo
+  local up load mem_used mem_tot mem_pct disk_info disk_pct
+  up=$(uptime -p 2>/dev/null || uptime | awk -F'up ' '{print $2}' | cut -d',' -f1)
+  load=$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null || echo "?")
+  read -r mem_used mem_tot mem_pct < <(free -m | awk '/^Mem:/ {printf "%d %d %.0f", $3, $2, ($3/$2)*100}')
+  disk_info=$(df -h / | awk 'NR==2 {printf "%s / %s (%s)", $3, $2, $5}')
+  disk_pct=$(df -P / | awk 'NR==2 {gsub("%","",$5); print $5}')
+  echo "  Аптайм:       ${B}${up}${N}"
+  echo "  Нагрузка CPU: ${B}${load}${N}  (ядер: $(nproc 2>/dev/null || echo '?'))"
+  echo "  Память RAM:   ${B}${mem_used} / ${mem_tot} МБ (${mem_pct}%)${N}"
+  if ((${disk_pct:-0} >= 85)); then
+    echo "  Диск (/):     ${R}${B}${disk_info} — ВНИМАНИЕ: мало места!${N}"
+  else
+    echo "  Диск (/):     ${G}${disk_info}${N}"
+  fi
+  echo
+  echo "${B}Процессы VPN-стека (CPU% / RAM% / RSS):${N}"
+  ps -eo comm,%cpu,%mem,rss --sort=-%mem 2>/dev/null | awk '
+    /^(xray-linux|x-ui|nginx|python3|mtg-linux)/ {
+      printf "  %-18s CPU: %5s%%   RAM: %5s%%   (%5.1f МБ)\n", $1, $2, $3, $4/1024
+      found=1
+    }
+    END { if (!found) print "  (процессы не найдены)" }
+  ' | head -n 12
+}
+
+cmd_online() {
+  echo "${B}📡 Живые подключения и онлайн-клиенты${N}"
+  echo
+  local onlines cnt tcp_est udp_cnt
+  onlines=$(api POST "inbounds/onlines" '{}' 2>/dev/null || echo "[]")
+  cnt=$(jq 'if type=="array" then length else 0 end' <<<"$onlines" 2>/dev/null || echo 0)
+  echo "  Клиентов онлайн (по данным Xray): ${G}${B}${cnt}${N}"
+  if ((cnt > 0)); then
+    jq -r '.[]' <<<"$onlines" | sed 's/^/    • /'
+  fi
+  echo
+  tcp_est=$(ss -Htn state established '( sport = :443 )' 2>/dev/null | wc -l | tr -d ' ')
+  udp_cnt=$(ss -Hun '( sport = :443 or sport = :51821 or sport = :51822 )' 2>/dev/null | wc -l | tr -d ' ')
+  echo "  Активных TCP-сессий на :443:      ${B}${tcp_est:-0}${N}"
+  echo "  Активных UDP-сокетов (HY2/AWG):   ${B}${udp_cnt:-0}${N}"
+  echo
+  echo "${B}Топ-5 клиентов по общему трафику:${N}"
+  clients 2>/dev/null | jq -r '
+    map(select(.subId != null and (.email | test("-awg[0-9]*$") | not)))
+    | map({email, used: ((.traffic.up // 0) + (.traffic.down // 0))})
+    | sort_by(-.used) | .[:5][] | [.email, .used] | @tsv' 2>/dev/null | while IFS=$'\t' read -r em us; do
+      [[ -n $em ]] && printf '  • %-20s %s\n' "$em" "$(human "${us:-0}")"
+    done
+}
+
+# ---------- Брендирование подписки и заглушки (v1.3.0) ----------
+
+net_brand_show() {
+  local all title sup
+  all=$(api POST setting/all '{}')
+  title=$(jq -r '.subTitle // ""' <<<"$all")
+  sup=$(jq -r '.subSupportUrl // ""' <<<"$all")
+  echo "${B}🎨 Брендирование подписки и сайта-заглушки${N}"
+  echo "  1. Название подписки (в клиентах): ${G}${title:-не задано}${N}"
+  echo "  2. Контакты поддержки (Telegram):  ${C}${sup:-не задано}${N}"
+  echo "  3. HTML-заглушка главного сайта:   /var/www/waga/index.html ($(wc -c </var/www/waga/index.html 2>/dev/null || echo 0) байт)"
+}
+
+net_brand() { # [title ТЕКСТ | support URL | stub-edit | stub-file ПУТЬ]
+  local sub=${1:-} all
+  case ${sub,,} in
+    "" | show) net_brand_show ;;
+    title)
+      shift; local t="$*"
+      [[ -n $t ]] || die "waga net brand title \"Новое название\""
+      all=$(api POST setting/all '{}')
+      api POST setting/update "$(jq -c --arg v "$t" '.subTitle = $v' <<<"$all")" >/dev/null || die "Панель не приняла название."
+      say "Название подписки изменено на: ${B}$t${N}" ;;
+    support)
+      shift; local u="${1:-}"
+      all=$(api POST setting/all '{}')
+      api POST setting/update "$(jq -c --arg v "$u" '.subSupportUrl = $v' <<<"$all")" >/dev/null || die "Панель не приняла ссылку поддержки."
+      if [[ -n $u ]]; then say "Ссылка поддержки установлена: ${B}$u${N}"; else say "Ссылка поддержки очищена."; fi ;;
+    stub-edit)
+      install -d -m 755 /var/www/waga
+      ${EDITOR:-nano} /var/www/waga/index.html
+      chmod 644 /var/www/waga/index.html
+      [[ -n $(hy_masq_state) ]] && hy_masq on >/dev/null 2>&1 || true
+      say "HTML-заглушка обновлена (и синхронизирована с Hysteria2)." ;;
+    stub-file)
+      local f=${2:-}
+      [[ -f $f && -r $f ]] || die "Файл не найден: $f"
+      install -d -m 755 /var/www/waga
+      install -m 644 "$f" /var/www/waga/index.html
+      [[ -n $(hy_masq_state) ]] && hy_masq on >/dev/null 2>&1 || true
+      say "HTML-заглушка заменена из файла $f." ;;
+    *) die "waga net brand [show | title ТЕКСТ | support URL | stub-edit | stub-file ПУТЬ]" ;;
+  esac
+}
+
+n_brand() {
+  net_brand_show
+  echo
+  echo "  1. Изменить название подписки ${D}(отображается в Happ/v2rayN/NekoBox)${N}"
+  echo "  2. Указать контакты поддержки ${D}(ссылка на Telegram, напр. https://t.me/user)${N}"
+  echo "  3. Редактировать HTML-заглушку ${D}(/var/www/waga/index.html в nano)${N}"
+  echo "  4. Загрузить свою HTML-заглушку из файла ${D}(указать путь к .html)${N}"
+  echo "  0. Назад"
+  ask_num "Выбор [0-4]: "
+  case $REPLY in
+    1) ask_tty "Новое название подписки: "; [[ -n $REPLY ]] && net_brand title "$REPLY" ;;
+    2) ask_tty "Ссылка на поддержку (пусто – убрать): "; net_brand support "${REPLY//[[:space:]]/}" ;;
+    3) net_brand stub-edit ;;
+    4) ask_tty "Путь к HTML-файлу: "; [[ -n ${REPLY//[[:space:]]/} ]] && net_brand stub-file "${REPLY//[[:space:]]/}" ;;
+  esac
 }
 
 cmd_check() {
@@ -3346,6 +3493,7 @@ cmd_net() {
     awg) net_awg_obf "$@" ;;
     happ) net_happ ;;
     sub-legacy) net_sub_legacy "$@" ;;
+    brand) net_brand "$@" ;;
     warp) case ${1:-status} in install|on) warp_install ;; remove|off) warp_remove ;; *) warp_status ;; esac ;;
     *) die "waga net [site [cleanup] | port имя порт | off имя | on имя | fp отпечаток | masq on|off | dns on|off | panel domain|ip | split on|off|check|apply | vision on|off]" ;;
   esac
@@ -3353,18 +3501,43 @@ cmd_net() {
 
 # ---------- меню (как у x-ui) ----------
 
-BOX_W=48
-box_rule() { local i; for ((i = 0; i < BOX_W; i++)); do printf '─'; done; }
-box_top() { printf '╔'; box_rule; printf '╗\n'; }
-box_bot() { printf '╚'; box_rule; printf '╝\n'; }
-box_sep() { printf '│'; box_rule; printf '│\n'; }
-padr() { local n=$(($2 - ${#1})); ((n < 0)) && n=0; printf '%s%*s' "$1" "$n" ''; }  # по символам: printf %-Ns считает байты
-box_line() { printf '│  %s│\n' "$(padr "$1" $((BOX_W - 2)))"; }
+BOX_W=74
+strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g' <<<"$1"; }
+box_rule() { local i; for ((i = 0; i < BOX_W; i++)); do printf '═'; done; }
+box_thin() { local i; for ((i = 0; i < BOX_W; i++)); do printf '─'; done; }
+box_top() { printf '%s╔' "$C"; box_rule; printf '╗%s\n' "$N"; }
+box_bot() { printf '%s╚' "$C"; box_rule; printf '╝%s\n' "$N"; }
+box_sep() { printf '%s╟' "$C"; box_thin; printf '╢%s\n' "$N"; }
+padr() {
+  local plain n
+  plain=$(strip_ansi "$1")
+  n=$(($2 - ${#plain}))
+  ((n < 0)) && n=0
+  printf '%s%*s' "$1" "$n" ''
+}
+box_line() { printf '%s║%s  %s%s║%s\n' "$C" "$N" "$(padr "$1" $((BOX_W - 2)))" "$C" "$N"; }
 box() { # заголовок, затем пункты; пустой пункт – разделитель
   local t=$1 l; shift
-  box_top; box_line "$t"; box_sep
-  for l in "$@"; do if [[ -z $l ]]; then box_sep; else box_line "$l"; fi; done
+  box_top
+  box_line "${B}${C}${t}${N}"
+  box_sep
+  for l in "$@"; do
+    if [[ -z $l ]]; then box_sep
+    else box_line "$l"; fi
+  done
   box_bot
+}
+waga_logo() {
+  printf '%s' "$C"
+  cat <<'ART'
+   ██╗    ██╗ █████╗  ██████╗  █████╗     ██╗   ██╗██████╗ ███╗   ██╗
+   ██║    ██║██╔══██╗██╔════╝ ██╔══██╗    ██║   ██║██╔══██╗████╗  ██║
+   ██║ █╗ ██║███████║██║  ███╗███████║    ██║   ██║██████╔╝██╔██╗ ██║
+   ██║███╗██║██╔══██║██║   ██║██╔══██║    ╚██╗ ██╔╝██╔═══╝ ██║╚██╗██║
+   ╚███╔███╔╝██║  ██║╚██████╔╝██║  ██║     ╚████╔╝ ██║     ██║ ╚████║
+    ╚══╝╚══╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝      ╚═══╝  ╚═╝     ╚═╝  ╚═══╝
+ART
+  printf '%s' "$N"
 }
 ask_tty() { read -r -p "$1" REPLY </dev/tty || exit 0; }
 ask_num() { ask_tty "$1"; REPLY=${REPLY//[[:space:]]/}; }
@@ -3374,13 +3547,15 @@ mh() { [[ ${WAGA_IN_MENU:-} == 1 ]] || printf '%s' "$*"; }
 run_action() { ( export WAGA_IN_MENU=1; "$@" ) || true; }
 
 menu_status() {
-  local sni users st auto
+  local sni users st auto ram disk
   sni=$(sni_targets 2>/dev/null | awk -F'\t' '$2 == "reality" || $2 == "self" {print $4; exit}' || true)
   users=$(clients 2>/dev/null | jq '[.[] | select(.email | test("-awg[0-9]*$") | not)] | length' 2>/dev/null || echo "?")
-  if systemctl is-active -q x-ui; then st="панель работает"; else st="панель НЕ работает"; fi
-  if auto_enabled; then auto=вкл; else auto=выкл; fi
-  echo "Сервер: ${HOST:-?} · Сайт маскировки: ${sni:--}"
-  echo "Состояние: $st · Xray $(xray_version 2>/dev/null || echo '?') · пользователей $users · автообновление $auto"
+  if systemctl is-active -q x-ui; then st="${G}● работает${N}"; else st="${R}● ОСТАНОВЛЕНА${N}"; fi
+  if auto_enabled; then auto="${G}вкл${N}"; else auto="${D}выкл${N}"; fi
+  ram=$(free -m 2>/dev/null | awk '/^Mem:/ {printf "%d/%dМБ", $3, $2}' || echo "?")
+  disk=$(df -P / 2>/dev/null | awk 'NR==2 {print $5}' || echo "?")
+  echo "  ${B}Сервер:${N} ${C}${HOST:-?}${N}  │  ${B}Маскировка:${N} ${sni:--}  │  ${B}Панель:${N} $st"
+  echo "  ${B}Xray:${N} $(xray_version 2>/dev/null || echo '?')  │  ${B}Клиенты:${N} ${G}${users}${N}  │  ${B}RAM:${N} $ram  │  ${B}Диск:${N} $disk  │  ${B}Авто:${N} $auto"
 }
 
 pick_user() {
@@ -3428,7 +3603,15 @@ menu_users() {
   local c
   while :; do
     echo
-    box "Пользователи" "1. Список (трафик, срок, статус)" "2. Добавить" "3. Показать ссылки" "4. Изменить лимит" "5. Выключить или включить" "6. Удалить" "7. Импорт клиентов из старой БД" "" "0. Назад"
+    box "👥 Пользователи" \
+      "${B}1.${N} Список клиентов ${D}(трафик, срок действия, статус)${N}" \
+      "${B}2.${N} Добавить клиента ${D}(создать подписку и ключи)${N}" \
+      "${B}3.${N} Показать ссылки ${D}(подписка, QR-код, Amnezia, TG)${N}" \
+      "${B}4.${N} Изменить лимит ${D}(ГБ, дни, лимит устройств)${N}" \
+      "${B}5.${N} Вкл / Выкл клиента ${D}(временная блокировка доступа)${N}" \
+      "${B}6.${N} Удалить клиента ${D}(убрать со всех протоколов)${N}" \
+      "${B}7.${N} Импорт из старой БД ${D}(перенос клиентов без поломки)${N}" "" \
+      "${B}0.${N} Назад"
     ask_num "Выбор [0-7]: "; c=$REPLY
     case $c in
       1) run_action cmd_list; pause ;;
@@ -3554,8 +3737,26 @@ menu_net() {
   local c
   while :; do
     echo
-    box "Протоколы, порты и маскировка" "1. Показать протоколы и порты" "2. Сменить сайт маскировки" "3. Сменить порт протокола" "4. Выключить или включить протокол" "5. Сменить отпечаток клиента" "6. Второй REALITY на высоком порту" "7. Панель и подписка: по IP или по домену" "8. Раздельная маршрутизация" "9. DNS в подписках (против утечек)" "10. Hysteria2: ответ чужим запросам" "11. Убрать прежние имена сайта" "12. Поток vision у REALITY" "13. Маршрутизация GEMINI в панели" "14. Обфускация AmneziaWG" "15. Happ: баннер и внешние ноды" "16. Совместимость старого пути /sub/" "" "0. Назад"
-    ask_num "Выбор [0-16]: "; c=$REPLY
+    box "🌐 Протоколы, порты и маскировка" \
+      "${B} 1.${N} Протоколы и порты ${D}(статус всех подключений)${N}" \
+      "${B} 2.${N} Сменить сайт маскировки ${D}(подбор нового SNI)${N}" \
+      "${B} 3.${N} Сменить порт протокола ${D}(с автоправкой UFW)${N}" \
+      "${B} 4.${N} Вкл / Выкл протокол ${D}(управление инбаундами)${N}" \
+      "${B} 5.${N} Сменить отпечаток TLS ${D}(chrome, firefox, safari)${N}" \
+      "${B} 6.${N} Второй REALITY ${D}(запасной на высоком порту)${N}" \
+      "${B} 7.${N} Панель: IP или домен ${D}(смена адреса входа)${N}" \
+      "${B} 8.${N} Раздельная маршрутизация ${D}(список сайтов через VPN)${N}" \
+      "${B} 9.${N} DNS в подписках ${D}(DoH против утечек DNS)${N}" \
+      "${B}10.${N} Маскировка Hysteria2 ${D}(ответ сайтом на HTTP/3)${N}" \
+      "${B}11.${N} Убрать старые SNI ${D}(очистка льготных имён)${N}" \
+      "${B}12.${N} Поток vision у REALITY ${D}(ускорение и совместимость)${N}" \
+      "${B}13.${N} Маршрутизация GEMINI / WARP ${D}(6 доменов AI + WARP)${N}" \
+      "${B}14.${N} Обфускация AmneziaWG ${D}(classic / mid / full 3.1)${N}" \
+      "${B}15.${N} Happ: баннер и VPS-ноды ${D}(announce и доп. серверы)${N}" \
+      "${B}16.${N} Совместимость /sub/ ${D}(работа старых подписок)${N}" \
+      "${B}17.${N} Брендирование подписки ${D}(название, TG, HTML-заглушка)${N}" "" \
+      "${B} 0.${N} Назад"
+    ask_num "Выбор [0-17]: "; c=$REPLY
     case $c in
       1) run_action net_show; pause ;;
       2) run_action n_site; pause ;;
@@ -3573,6 +3774,7 @@ menu_net() {
       14) run_action n_awg_obf; pause ;;
       15) run_action net_happ; pause ;;
       16) run_action n_sub_legacy; pause ;;
+      17) run_action n_brand; pause ;;
       0 | "") return 0 ;;
       *) echo "Нет такого пункта." ;;
     esac
@@ -3583,12 +3785,22 @@ menu_check() {
   local c
   while :; do
     echo
-    box "Проверка сервера" "1. Быстрая проверка" "2. Глубокая (подключиться клиентом)" "3. Исправить безопасное" "" "0. Назад"
-    ask_num "Выбор [0-3]: "; c=$REPLY
+    box "🩺 Проверка и мониторинг сервера" \
+      "${B}1.${N} Быстрая проверка ${D}(службы, порты, TLS, DNS, Gemini)${N}" \
+      "${B}2.${N} Глубокая проверка ${D}(тест подключения реальным клиентом)${N}" \
+      "${B}3.${N} Исправить безопасное ${D}(автопочинка служб, прав и DNS)${N}" "" \
+      "${B}4.${N} Тест скорости канала ${D}(замер down/up и пинга VPS)${N}" \
+      "${B}5.${N} Ресурсы сервера ${D}(CPU, RAM, диск, процессы Xray/Nginx)${N}" \
+      "${B}6.${N} Живые подключения ${D}(онлайн-клиенты, сессии и топ трафика)${N}" "" \
+      "${B}0.${N} Назад"
+    ask_num "Выбор [0-6]: "; c=$REPLY
     case $c in
       1) run_action cmd_check; pause ;;
       2) run_action cmd_check --deep; pause ;;
       3) run_action cmd_fix; pause ;;
+      4) run_action cmd_speedtest; pause ;;
+      5) run_action cmd_resources; pause ;;
+      6) run_action cmd_online; pause ;;
       0 | "") return 0 ;;
       *) echo "Нет такого пункта." ;;
     esac
@@ -4558,6 +4770,148 @@ s_tunnel() {
   esac
 }
 
+
+# --- 9. Блокировка спам-портов SMTP (25, 465, 587) в Xray ---
+
+sec_smtp_status() {
+  local cur has
+  cur=$(api POST setting/all '{}' 2>/dev/null | jq -r '.xrayTemplateConfig // ""' 2>/dev/null || true)
+  has=$(python3 - "$cur" <<'PY' 2>/dev/null || echo 0
+import json, sys
+try:
+    cfg = json.loads(sys.argv[1]) if sys.argv[1] else {}
+except Exception:
+    print(0); sys.exit(0)
+for r in cfg.get("routing", {}).get("rules", []):
+    if r.get("outboundTag") == "blocked" and "25" in str(r.get("port", "")):
+        print(1); sys.exit(0)
+print(0)
+PY
+)
+  if [[ $has == 1 ]]; then
+    printf '%s\n' "${G}✅${N} Блокировка SMTP (25, 465, 587): включена в Xray (защита от спам-абуз)"
+  else
+    printf '%s\n' "${D}ℹ ${N} Блокировка SMTP (25, 465, 587): выключена"
+  fi
+}
+
+sec_smtp_toggle() { # on|off
+  local act=${1:-on} all cur patched
+  all=$(api POST setting/all '{}'); cur=$(jq -r '.xrayTemplateConfig // ""' <<<"$all")
+  patched=$(python3 - "$cur" "$act" <<'PY'
+import json, sys
+raw, act = sys.argv[1], sys.argv[2]
+cfg = json.loads(raw) if raw else {"outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "blocked", "protocol": "blackhole"}], "routing": {"domainStrategy": "AsIs", "rules": []}}
+rt = cfg.setdefault("routing", {"domainStrategy": "AsIs", "rules": []})
+rules = [r for r in rt.get("rules", []) if not (r.get("outboundTag") == "blocked" and str(r.get("port", "")) == "25,465,587")]
+if act == "on":
+    rules.append({"type": "field", "port": "25,465,587", "outboundTag": "blocked"})
+rt["rules"] = rules
+print(json.dumps(cfg, ensure_ascii=False, indent=2))
+PY
+) || die "Не удалось обновить шаблон Xray."
+  api POST setting/update "$(jq -c --arg t "$patched" '.xrayTemplateConfig = $t' <<<"$all")" >/dev/null || die "Панель не приняла правило SMTP."
+  xray_restart_core
+  if [[ $act == on ]]; then say "Исходящие SMTP-порты (25, 465, 587) заблокированы в Xray."; else say "Блокировка SMTP в Xray выключена."; fi
+}
+
+# --- 10. Автоматическая ротация SNI (таймер systemd) ---
+
+sec_sni_auto_status() {
+  if systemctl is-enabled -q waga-sni-rotate.timer 2>/dev/null; then
+    local cal
+    cal=$(awk -F= '/^OnCalendar=/{print $2}' /etc/systemd/system/waga-sni-rotate.timer 2>/dev/null || echo "weekly")
+    printf '%s\n' "${G}✅${N} Авторотация SNI маскировки: включена ($cal)"
+  else
+    printf '%s\n' "${D}ℹ ${N} Авторотация SNI маскировки: выключена"
+  fi
+}
+
+sec_sni_auto_on() { # weekly|monthly
+  local period=${1:-weekly}
+  [[ $period == weekly || $period == monthly ]] || die "Период: weekly или monthly."
+  cat >/etc/systemd/system/waga-sni-rotate.service <<'UNIT'
+[Unit]
+Description=WAGA: автоматическая смена сайта маскировки (SNI)
+After=network-online.target x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/waga net site --nearby
+UNIT
+  cat >/etc/systemd/system/waga-sni-rotate.timer <<UNIT
+[Unit]
+Description=WAGA: авторотация SNI ($period)
+
+[Timer]
+OnCalendar=$period
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now waga-sni-rotate.timer >/dev/null 2>&1
+  say "Авторотация SNI включена ($period). Прежнее имя работает ещё 7 дней, чтобы клиенты успели обновить подписку."
+}
+
+sec_sni_auto_off() {
+  systemctl disable --now waga-sni-rotate.timer waga-sni-rotate.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/waga-sni-rotate.timer /etc/systemd/system/waga-sni-rotate.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  say "Авторотация SNI выключена."
+}
+
+# --- 11. Проверка чистоты IP и блокировок (DNSBL / геолокация) ---
+
+sec_ip_check() {
+  local ip rev bl res listed=0
+  ip=$(host_ip)
+  [[ -n $ip ]] || die "Не удалось определить IPv4 сервера."
+  echo "${B}🔐 Проверка чистоты IP-адреса сервера (${ip})${N}"
+  echo
+  local info
+  info=$(curl -4 -fsS -m 8 "https://ipinfo.io/${ip}/json" 2>/dev/null || true)
+  if [[ -n $info ]]; then
+    echo "  Страна / Город: $(jq -r '[.country, .city] | map(select(. != null)) | join(", ")' <<<"$info" 2>/dev/null)"
+    echo "  Провайдер ASN:  $(jq -r '.org // "?"' <<<"$info" 2>/dev/null)"
+  fi
+  echo
+  echo "  Проверка публичных блэклистов (DNSBL):"
+  IFS=. read -r a b c d <<<"$ip"
+  rev="${d}.${c}.${b}.${a}"
+  for bl in zen.spamhaus.org bl.spamcop.net b.barracudacentral.org dnsbl.sorbs.net; do
+    res=$(getent ahostsv4 "${rev}.${bl}" 2>/dev/null | awk 'NR==1{print $1}' || true)
+    if [[ -n $res && $res != 127.255.* ]]; then
+      echo "    ${R}❌${N} ${bl}: найден в списке ($res)"
+      listed=$((listed + 1))
+    else
+      echo "    ${G}✅${N} ${bl}: чисто"
+    fi
+  done
+  echo
+  if ((listed == 0)); then
+    echo "  ${G}Итог: IP чист по проверенным базам спама.${N}"
+  else
+    echo "  ${Y}Итог: IP найден в ${listed} базах — рекомендуется включить блокировку SMTP и WARP для AI-сервисов.${N}"
+  fi
+}
+
+s_smtp() {
+  sec_smtp_status
+  echo
+  ask_num "1 – включить блокировку SMTP (25,465,587), 2 – выключить, Enter – назад: "
+  case $REPLY in 1) sec_smtp_toggle on ;; 2) sec_smtp_toggle off ;; esac
+}
+
+s_sni_auto() {
+  sec_sni_auto_status
+  echo
+  ask_num "1 – включить (раз в неделю), 2 – включить (раз в месяц), 3 – выключить, Enter – назад: "
+  case $REPLY in 1) sec_sni_auto_on weekly ;; 2) sec_sni_auto_on monthly ;; 3) sec_sni_auto_off ;; esac
+}
+
 # --- Общий статус и интерактивные подменю защиты ---
 
 sec_status() {
@@ -4570,6 +4924,8 @@ sec_status() {
   sec_ratelimit_status
   sec_2fa_status
   sec_headers_status
+  sec_smtp_status
+  sec_sni_auto_status
 }
 
 s_fail2ban() {
@@ -4725,6 +5081,11 @@ cmd_sec() {
       case ${1:-status} in on) sec_headers_on "${2:-auto}" ;; off) sec_headers_off ;; status) sec_headers_status ;; *) die "waga sec headers [on [strict|ip-ok] | off | status]" ;; esac ;;
     tunnel)
       case ${1:-list} in relay) shift; sec_tun_add_relay "$@" ;; reverse) shift; sec_tun_add_reverse "$@" ;; del) sec_tun_del "${2:-}" ;; *) sec_tun_list ;; esac ;;
+    smtp)
+      case ${1:-status} in on) sec_smtp_toggle on ;; off) sec_smtp_toggle off ;; *) sec_smtp_status ;; esac ;;
+    sni-auto)
+      case ${1:-status} in weekly|monthly) sec_sni_auto_on "$1" ;; off) sec_sni_auto_off ;; *) sec_sni_auto_status ;; esac ;;
+    ip-check) sec_ip_check ;;
     *) die "waga sec [status | fail2ban | sysctl | updates | domain | ratelimit | 2fa | headers]" ;;
   esac
 }
@@ -4733,19 +5094,22 @@ menu_sec() {
   local c
   while :; do
     echo
-    box "Защита и оптимизация сервера" \
-      "1. Статус всех модулей защиты" \
-      "2. Fail2ban (sshd + nginx + ignoreip)" \
-      "3. Тюнинг ядра sysctl (BBR + UDP + защита)" \
-      "4. Автообновления безопасности ОС" \
-      "5. Автообновление домена (DDNS + TLS)" \
-      "6. Rate limiting в Nginx (панель/подписка)" \
-      "7. 2FA (TOTP) в панели 3X-UI" \
-      "8. Жёсткие заголовки и сброс 444 в Nginx" \
-      "9. SSH-туннель между VPS (обход блокировки IP)" "" \
-      "10. Установить рекомендуемый пакет разом" \
-      "0. Назад"
-    ask_num "Выбор [0-10]: "; c=$REPLY
+    box "🛡️ Защита и оптимизация сервера" \
+      "${B} 1.${N} Статус всех модулей ${D}(сводка активной защиты)${N}" \
+      "${B} 2.${N} Fail2ban ${D}(бан брутфорса SSH/Nginx + ignoreip)${N}" \
+      "${B} 3.${N} Тюнинг ядра sysctl ${D}(BBR + UDP 16МБ + защита TCP)${N}" \
+      "${B} 4.${N} Обновления безопасности ОС ${D}(security-патчи без ребута)${N}" \
+      "${B} 5.${N} Автообновление домена ${D}(DDNS каждые 5 мин + TLS)${N}" \
+      "${B} 6.${N} Rate limiting в Nginx ${D}(защита панели/подписки от флуда)${N}" \
+      "${B} 7.${N} 2FA (TOTP) в 3X-UI ${D}(вход в панель по коду с телефона)${N}" \
+      "${B} 8.${N} Заголовки и сброс 444 ${D}(отсечение чужих Host и методов)${N}" \
+      "${B} 9.${N} SSH-туннель между VPS ${D}(доступ к SSH без VPN/tun)${N}" \
+      "${B}10.${N} Блокировка SMTP-портов ${D}(запрет 25/465/587 от спам-абуз)${N}" \
+      "${B}11.${N} Авторотация SNI ${D}(плановая смена маскировки)${N}" \
+      "${B}12.${N} Проверка чистоты IP ${D}(блэклисты DNSBL и геолокация)${N}" "" \
+      "${B}13.${N} Установить рекомендуемый пакет ${D}(sysctl + F2B + Nginx + ОС)${N}" \
+      "${B} 0.${N} Назад"
+    ask_num "Выбор [0-13]: "; c=$REPLY
     case $c in
       1) run_action sec_status; pause ;;
       2) run_action s_fail2ban; pause ;;
@@ -4756,7 +5120,10 @@ menu_sec() {
       7) run_action s_2fa; pause ;;
       8) run_action s_headers; pause ;;
       9) run_action s_tunnel; pause ;;
-      10) run_action s_recommended; pause ;;
+      10) run_action s_smtp; pause ;;
+      11) run_action s_sni_auto; pause ;;
+      12) run_action sec_ip_check; pause ;;
+      13) run_action s_recommended; pause ;;
       0 | "") return 0 ;;
       *) echo "Нет такого пункта." ;;
     esac
@@ -4767,14 +5134,25 @@ menu_main() {
   local c
   while :; do
     echo
-    box "WAGA · Дядя Вова VPN $WAGA_VERSION – управление сервером" "1. Пользователи" "2. Протоколы, порты и маскировка" "3. Проверка сервера" "4. Защита и оптимизация сервера" "" \
-      "5. Обновить waga и подписку" "6. Обновить панель 3X-UI" "7. Автообновление: включить или выключить" "" \
-      "8. Резервная копия" "9. Версии" "" "10. Панель 3X-UI (меню x-ui)" "11. Удалить WAGA с сервера" "0. Выход"
+    waga_logo
+    box "🚀 WAGA · Дядя Вова VPN v${WAGA_VERSION} — Центр управления сервером" \
+      "${B} 1.${N} Пользователи ${D}(добавить, ссылки, лимиты, импорт БД)${N}" \
+      "${B} 2.${N} Протоколы и маскировка ${D}(порты, SNI, Gemini, WARP, бренд)${N}" \
+      "${B} 3.${N} Проверка и мониторинг ${D}(тест скорости, ресурсы, онлайн)${N}" \
+      "${B} 4.${N} Защита и оптимизация ${D}(Fail2ban, BBR, 2FA, SMTP, туннели)${N}" "" \
+      "${B} 5.${N} Обновить waga и подписку ${D}(новая версия скриптов WAGA)${N}" \
+      "${B} 6.${N} Обновить панель 3X-UI ${D}(проверенная версия с сохранением)${N}" \
+      "${B} 7.${N} Автообновление ${D}(вкл/выкл ночных обновлений WAGA)${N}" "" \
+      "${B} 8.${N} Резервная копия ${D}(архив базы, ключей и настроек)${N}" \
+      "${B} 9.${N} Версии компонентов ${D}(WAGA, 3X-UI, Xray)${N}" "" \
+      "${B}10.${N} Меню панели x-ui ${D}(оригинальное консольное меню 3X-UI)${N}" \
+      "${B}11.${N} Удалить WAGA с сервера ${D}(полная очистка с бэкапом)${N}" \
+      "${B} 0.${N} Выход"
     echo
     menu_status
     update_hint
     echo
-    ask_num "Выбор [0-11]: "; c=$REPLY
+    ask_num "${B}Выбор [0-11]:${N} "; c=$REPLY
     case $c in
       1) menu_users ;;
       2) menu_net ;;
@@ -4824,7 +5202,7 @@ cmd_uninstall() { # [--yes] [--no-backup] [--dry-run]
       *) die "waga uninstall [--yes] [--no-backup] [--dry-run]" ;;
     esac
   done
-  local -a units=(x-ui waga-sub waga-limit.timer waga-limit.service waga-update.timer waga-update.service waga-ddns.timer waga-ddns.service)
+  local -a units=(x-ui waga-sub waga-limit.timer waga-limit.service waga-update.timer waga-update.service waga-ddns.timer waga-ddns.service waga-sni-rotate.timer waga-sni-rotate.service)
   local -a paths=(/usr/local/x-ui /etc/x-ui /var/log/x-ui /usr/local/lib/waga-sub /etc/waga-sub /etc/waga /var/www/waga
     /etc/nginx/waga-stream.conf /etc/nginx/conf.d/waga.conf /etc/cron.d/waga-xui-menu /etc/cron.d/waga-sub-cert /etc/cron.d/waga-nginx-reload
     /root/cert/ip /root/cert/custom /root/cert/self /root/cert/domain /root/waga.txt /usr/bin/x-ui
@@ -4989,6 +5367,9 @@ case "$cmd_key" in
   "uninstall"*) shift; cmd_uninstall "$@" ;;
   "sec ") shift; cmd_sec ;;
   "sec "*) shift; cmd_sec "$@" ;;
+  "speed"*) cmd_speedtest ;;
+  "res"*) cmd_resources ;;
+  "online"*) cmd_online ;;
   "check "*) shift; cmd_check "$@" ;;
   "fix "*) shift; cmd_fix "$@" ;;
   "version "*|"--version "*|"-v "*) cmd_version ;;

@@ -53,3 +53,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/mai
 - **Автоустановка Cloudflare WARP (`127.0.0.1:40000`)** (`waga net warp install` или `waga → 2 → 13`) — локальный SOCKS5-прокси для Gemini без изменения системных маршрутов.
 - **Автопроверка и починка DNS** — при установке и в `waga check` / `waga fix`.
 - **SSH-туннель между двумя VPS без VPN/tun** (`waga sec tunnel` или `waga → 4 → 9`) — TCP-проброс (`relay`) и обратный SSH-туннель (`reverse`) со сменой портов.
+
+## Новое в v1.3.0
+- **Дизайнерское меню `waga`**: ASCII-логотип, цветная рамка, статус-панель (IP, маскировка, Xray, клиенты, RAM, диск) и краткие пояснения в скобках для каждой команды.
+- **Мониторинг (`waga → 3`)**: тест скорости канала (`waga speed`), потребление CPU/RAM/диска (`waga res`), живые подключения и топ трафика (`waga online`).
+- **Защита (`waga → 4`)**: блокировка исходящих SMTP-портов 25/465/587 (`waga sec smtp`), авторотация SNI по таймеру (`waga sec sni-auto`), проверка чистоты IP по DNSBL (`waga sec ip-check`).
+- **Брендирование подписки (`waga → 2 → 17` / `waga net brand`)**: название подписки, ссылка поддержки Telegram и своя HTML-заглушка.
