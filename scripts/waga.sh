@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 export LC_ALL=C.UTF-8  # ширина колонок по символам, а не байтам
 
-WAGA_VERSION="1.3.1"
+WAGA_VERSION="1.3.2"
 WAGA_RAW="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main"
 # Файлы новой версии берём из её тега, а не из меняющейся ветки main.
 waga_ref_raw() { echo "https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/v$1"; }
@@ -5045,6 +5045,141 @@ s_recommended() {
   echo "  • Пункт 7 – 2FA (TOTP) для входа в панель 3X-UI"
 }
 
+
+# --- 12. Каскадное подключение (VPN-мост: этот VPS → второй VPS по TCP/UDP) ---
+sec_cascade_list() {
+  local found=0 f name st proto lport target host
+  host=$(host_addr 2>/dev/null || my_ip)
+  echo "${B}🌉 Активные каскадные мосты WAGA (Entry VPS → Exit VPS):${N}"
+  for f in /etc/systemd/system/waga-cascade-*.service; do
+    [[ -f $f ]] || continue
+    found=1
+    name=${f##*/waga-cascade-}; name=${name%.service}
+    st=$(systemctl is-active "waga-cascade-${name}.service" 2>/dev/null || echo inactive)
+    proto=$(grep -oE 'TCP-LISTEN|UDP-LISTEN' "$f" | head -n1)
+    [[ $proto == UDP-LISTEN ]] && proto="UDP" || proto="TCP"
+    lport=$(grep -oE '(TCP|UDP)-LISTEN:[0-9]+' "$f" | head -n1 | cut -d: -f2)
+    target=$(grep -oE '(TCP|UDP):[^ ]+' "$f" | tail -n1 | cut -d: -f2-)
+    if [[ $st == active ]]; then
+      echo "  ✅ ${B}${name}${N} [${proto}] :${lport} → ${target}  ${G}(работает)${N}"
+    else
+      echo "  ❌ ${B}${name}${N} [${proto}] :${lport} → ${target}  ${R}(остановлен)${N}"
+    fi
+    echo "     ${D}В 3X-UI (External Proxy / адрес): ${host}:${lport}${N}"
+  done
+  (( found )) || echo "  ${D}(каскадных мостов нет)${N}"
+}
+
+sec_cascade_add() {
+  local name=${1:-} lport=${2:-} tip=${3:-} tport=${4:-443} proto=${5:-both}
+  [[ $name =~ ^[a-zA-Z0-9_-]{1,24}$ ]] || die "Имя моста: только латиница, цифры, - и _ (до 24 символов)."
+  [[ $lport =~ ^[0-9]+$ && $lport -ge 1024 && $lport -le 65535 ]] || die "Локальный порт должен быть от 1024 до 65535 (напр. 8443)."
+  [[ -n $tip ]] || die "Укажите IP или домен целевого (выходного) VPS."
+  [[ $tport =~ ^[0-9]+$ && $tport -ge 1 && $tport -le 65535 ]] || die "Целевой порт должен быть от 1 до 65535."
+  [[ $proto =~ ^(both|tcp|udp)$ ]] || die "Протокол: both, tcp или udp."
+  command -v socat >/dev/null 2>&1 || { say "Устанавливаю socat…"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat >/dev/null; }
+
+  local host
+  host=$(host_addr 2>/dev/null || my_ip)
+
+  if [[ $proto == both || $proto == tcp ]]; then
+    cat >"/etc/systemd/system/waga-cascade-${name}-tcp.service" <<EOF
+[Unit]
+Description=WAGA Cascade TCP Bridge (${name}: ${lport} -> ${tip}:${tport})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat -T300 TCP-LISTEN:${lport},fork,reuseaddr TCP:${tip}:${tport},keepalive
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    command -v ufw >/dev/null 2>&1 && ufw allow "${lport}/tcp" comment "waga-cascade-${name}" >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    systemctl enable --now "waga-cascade-${name}-tcp.service"
+  fi
+
+  if [[ $proto == both || $proto == udp ]]; then
+    cat >"/etc/systemd/system/waga-cascade-${name}-udp.service" <<EOF
+[Unit]
+Description=WAGA Cascade UDP Bridge (${name}: ${lport} -> ${tip}:${tport})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat -T60 UDP-LISTEN:${lport},fork,reuseaddr UDP:${tip}:${tport}
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    command -v ufw >/dev/null 2>&1 && ufw allow "${lport}/udp" comment "waga-cascade-${name}" >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    systemctl enable --now "waga-cascade-${name}-udp.service"
+  fi
+
+  say "Каскадный мост «${name}» запущен: ${host}:${lport} (${proto}) → ${tip}:${tport}"
+  echo
+  echo "${B}Как подключить в 3X-UI (чтобы клиенты шли через этот VPS):${N}"
+  echo "  1. Откройте инбаунд целевого сервера (${tip}) в панели 3X-UI."
+  echo "  2. Внизу включите ${B}External Proxy${N} (Внешний прокси) → Добавить:"
+  echo "     • Адрес: ${G}${host}${N}"
+  echo "     • Порт:  ${G}${lport}${N}"
+  echo "  3. Сохраните инбаунд и обновите подписку в Happ (🔄)."
+}
+
+sec_cascade_del() {
+  local name=${1:-} found=0 f lport p
+  [[ -n $name ]] || die "Укажите имя моста для удаления."
+  for p in tcp udp; do
+    f="/etc/systemd/system/waga-cascade-${name}-${p}.service"
+    [[ -f $f ]] || continue
+    found=1
+    lport=$(grep -oE '(TCP|UDP)-LISTEN:[0-9]+' "$f" | head -n1 | cut -d: -f2)
+    systemctl disable --now "waga-cascade-${name}-${p}.service" >/dev/null 2>&1 || true
+    rm -f "$f"
+    [[ -n $lport ]] && command -v ufw >/dev/null 2>&1 && ufw delete allow "${lport}/${p}" >/dev/null 2>&1 || true
+  done
+  if (( found )); then
+    systemctl daemon-reload
+    say "Каскадный мост «${name}» удалён."
+  else
+    die "Мост «${name}» не найден."
+  fi
+}
+
+s_cascade() {
+  local c name lport tip tport proto
+  sec_cascade_list
+  echo
+  echo "  1. Создать каскадный мост ${D}(порт этого VPS → порт второго VPS: TCP + UDP)${N}"
+  echo "  2. Удалить каскадный мост"
+  echo "  0. Назад"
+  ask_num "Выбор [0-2]: "; c=$REPLY
+  case $c in
+    1)
+      ask_tty "Имя моста (напр. mk): "; name=${REPLY//[[:space:]]/}
+      ask_tty "Порт на ЭТОМ VPS (напр. 8443): "; lport=${REPLY//[[:space:]]/}
+      ask_tty "IP или домен второго (выходного) VPS: "; tip=${REPLY//[[:space:]]/}
+      ask_tty "Порт на втором VPS [443]: "; tport=${REPLY//[[:space:]]/}; tport=${tport:-443}
+      ask_tty "Протокол (both / tcp / udp) [both]: "; proto=${REPLY//[[:space:]]/}; proto=${proto:-both}
+      sec_cascade_add "$name" "$lport" "$tip" "$tport" "$proto"
+      ;;
+    2)
+      ask_tty "Имя моста для удаления (без -tcp/-udp): "; name=${REPLY//[[:space:]]/}
+      sec_cascade_del "$name"
+      ;;
+  esac
+}
+
 cmd_sec() {
   local sub=${1:-}
   [[ -z $sub ]] || shift
@@ -5092,6 +5227,8 @@ cmd_sec() {
     sni-auto)
       case ${1:-status} in weekly|monthly) sec_sni_auto_on "$1" ;; off) sec_sni_auto_off ;; *) sec_sni_auto_status ;; esac ;;
     ip-check) sec_ip_check ;;
+    cascade)
+      case ${1:-list} in add) shift; sec_cascade_add "$@" ;; del) sec_cascade_del "${2:-}" ;; *) sec_cascade_list ;; esac ;;
     *) die "waga sec [status | fail2ban | sysctl | updates | domain | ratelimit | 2fa | headers]" ;;
   esac
 }
@@ -5112,10 +5249,11 @@ menu_sec() {
       "${B} 9.${N} SSH-туннель между VPS ${D}(доступ к SSH без VPN/tun)${N}" \
       "${B}10.${N} Блокировка SMTP-портов ${D}(запрет 25/465/587 от спам-абуз)${N}" \
       "${B}11.${N} Авторотация SNI ${D}(плановая смена маскировки)${N}" \
-      "${B}12.${N} Проверка чистоты IP ${D}(блэклисты DNSBL и геолокация)${N}" "" \
-      "${B}13.${N} Установить рекомендуемый пакет ${D}(sysctl + F2B + Nginx + ОС)${N}" \
+      "${B}12.${N} Проверка чистоты IP ${D}(блэклисты DNSBL и геолокация)${N}" \
+      "${B}13.${N} Каскадное подключение ${D}(VPN-мост: этот VPS → другой VPS)${N}" "" \
+      "${B}14.${N} Установить рекомендуемый пакет ${D}(sysctl + F2B + Nginx + ОС)${N}" \
       "${B} 0.${N} Назад"
-    ask_num "Выбор [0-13]: "; c=$REPLY
+    ask_num "Выбор [0-14]: "; c=$REPLY
     case $c in
       1) run_action sec_status; pause ;;
       2) run_action s_fail2ban; pause ;;
@@ -5129,7 +5267,8 @@ menu_sec() {
       10) run_action s_smtp; pause ;;
       11) run_action s_sni_auto; pause ;;
       12) run_action sec_ip_check; pause ;;
-      13) run_action s_recommended; pause ;;
+      13) run_action s_cascade; pause ;;
+      14) run_action s_recommended; pause ;;
       0 | "") return 0 ;;
       *) echo "Нет такого пункта." ;;
     esac
