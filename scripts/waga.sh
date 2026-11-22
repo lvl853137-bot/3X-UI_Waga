@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 export LC_ALL=C.UTF-8  # ширина колонок по символам, а не байтам
 
-WAGA_VERSION="1.3.2"
+WAGA_VERSION="1.3.3"
 WAGA_RAW="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main"
 # Файлы новой версии берём из её тега, а не из меняющейся ветки main.
 waga_ref_raw() { echo "https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/v$1"; }
@@ -5049,7 +5049,7 @@ s_recommended() {
 # --- 12. Каскадное подключение (VPN-мост: этот VPS → второй VPS по TCP/UDP) ---
 sec_cascade_list() {
   local found=0 f name st proto lport target host
-  host=$(host_addr 2>/dev/null || my_ip)
+  host=${HOST:-$(hostname -I | awk '{print $1}')}
   echo "${B}🌉 Активные каскадные мосты WAGA (Entry VPS → Exit VPS):${N}"
   for f in /etc/systemd/system/waga-cascade-*.service; do
     [[ -f $f ]] || continue
@@ -5080,7 +5080,7 @@ sec_cascade_add() {
   command -v socat >/dev/null 2>&1 || { say "Устанавливаю socat…"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat >/dev/null; }
 
   local host
-  host=$(host_addr 2>/dev/null || my_ip)
+  host=${HOST:-$(hostname -I | awk '{print $1}')}
 
   if [[ $proto == both || $proto == tcp ]]; then
     cat >"/etc/systemd/system/waga-cascade-${name}-tcp.service" <<EOF
@@ -5113,7 +5113,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/socat -T60 UDP-LISTEN:${lport},fork,reuseaddr UDP:${tip}:${tport}
+ExecStart=/usr/bin/socat -T60 UDP4-LISTEN:${lport},fork,reuseaddr UDP:${tip}:${tport}
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
