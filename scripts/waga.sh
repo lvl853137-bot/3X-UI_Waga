@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 export LC_ALL=C.UTF-8  # ширина колонок по символам, а не байтам
 
-WAGA_VERSION="1.3.0"
+WAGA_VERSION="1.3.1"
 WAGA_RAW="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main"
 # Файлы новой версии берём из её тега, а не из меняющейся ветки main.
 waga_ref_raw() { echo "https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/v$1"; }
@@ -1718,6 +1718,10 @@ net_brand() { # [title ТЕКСТ | support URL | stub-edit | stub-file ПУТЬ
       chmod 644 /var/www/waga/index.html
       [[ -n $(hy_masq_state) ]] && hy_masq on >/dev/null 2>&1 || true
       say "HTML-заглушка обновлена (и синхронизирована с Hysteria2)." ;;
+    hide-email)
+      all=$(api POST setting/all '{}')
+      api POST setting/update "$(jq -c '.subEmailInRemark = false | .remarkModel = "-i" | .remarkTemplate = "{{INBOUND}}"' <<<"$all")" >/dev/null || die "Не удалось обновить формат имён."
+      say "Имя пользователя убрано из названий подключений (оставлено только название сервера)." ;;
     stub-file)
       local f=${2:-}
       [[ -f $f && -r $f ]] || die "Файл не найден: $f"
@@ -1736,13 +1740,15 @@ n_brand() {
   echo "  2. Указать контакты поддержки ${D}(ссылка на Telegram, напр. https://t.me/user)${N}"
   echo "  3. Редактировать HTML-заглушку ${D}(/var/www/waga/index.html в nano)${N}"
   echo "  4. Загрузить свою HTML-заглушку из файла ${D}(указать путь к .html)${N}"
+  echo "  5. Убрать имя клиента из названий подключений ${D}(Швеция вместо Швеция-admin)${N}"
   echo "  0. Назад"
-  ask_num "Выбор [0-4]: "
+  ask_num "Выбор [0-5]: "
   case $REPLY in
     1) ask_tty "Новое название подписки: "; [[ -n $REPLY ]] && net_brand title "$REPLY" ;;
     2) ask_tty "Ссылка на поддержку (пусто – убрать): "; net_brand support "${REPLY//[[:space:]]/}" ;;
     3) net_brand stub-edit ;;
     4) ask_tty "Путь к HTML-файлу: "; [[ -n ${REPLY//[[:space:]]/} ]] && net_brand stub-file "${REPLY//[[:space:]]/}" ;;
+    5) net_brand hide-email ;;
   esac
 }
 

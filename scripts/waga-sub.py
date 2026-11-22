@@ -60,7 +60,9 @@ HAPP_HEADERS = ("routing", "routing-enable", "announce", "providerid", "new-url"
                 "sub-info-color", "sub-info-button-text", "sub-info-button-link",
                 "subscription-autoconnect", "subscription-autoconnect-type", "subscription-always-hwid-enable")
 PASS_HEADERS = ("content-type", "content-disposition", "profile-title", "profile-update-interval",
-                "profile-web-page-url", "subscription-userinfo", "support-url", "cache-control") + HAPP_HEADERS
+                "profile-web-page-url", "subscription-userinfo", "support-url", "cache-control"
+    "x-hwid-active", "x-hwid-limit", "x-hwid-used", "x-hwid-not-supported", "x-hwid-limit-exceeded",
+) + HAPP_HEADERS
 
 with open(CONFIG, encoding="utf-8") as f:
     CONF = json.load(f)
@@ -96,10 +98,12 @@ def log(msg):
     print(msg, flush=True)
 
 
-def upstream(sub_id, ua, host, accept, prefix=None):
+def upstream(sub_id, ua, host, accept, prefix=None, extra_hdrs=None):
     """GET к подписке 3X-UI. Возвращает (код, заголовки, тело) или (None, {}, b"")."""
-    req = urllib.request.Request(CONF["upstream"].rstrip("/") + (prefix or PATH) + sub_id, headers={
-        "User-Agent": ua, "Host": host, "Accept": accept or "*/*"})
+    hdrs = {"User-Agent": ua, "Host": host, "Accept": accept or "*/*"}
+    if extra_hdrs:
+        hdrs.update(extra_hdrs)
+    req = urllib.request.Request(CONF["upstream"].rstrip("/") + (prefix or PATH) + sub_id, headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
@@ -475,7 +479,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ua = self.headers.get("User-Agent", "")
         host = CONF.get("link_host") or self.headers.get("Host", CONF.get("host", ""))
         accept = self.headers.get("Accept", "")
-        code, headers, body = upstream(sub_id, upstream_ua(ua), host, accept, prefix)
+        extra_hdrs = {k: v for k, v in self.headers.items() if k.lower().startswith(("x-hwid", "x-device-", "x-ver-"))}
+        code, headers, body = upstream(sub_id, upstream_ua(ua), host, accept, prefix, extra_hdrs)
         if code is None:
             return self.send_html_error(502)
 
@@ -488,7 +493,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 body = strip_awg(body)
             elif code == 200 and awg and not sub_id.endswith(("-awg", "-tg")):
                 # Подмешиваем дополнительную подписку «<id>-awg» для второго профиля AmneziaWG.
-                acode, _, abody = upstream(sub_id + "-awg", ua, host, accept, prefix)
+                acode, _, abody = upstream(sub_id + "-awg", ua, host, accept, prefix, extra_hdrs)
                 if acode == 200 and abody:
                     body = merge_awg(body, abody)
             elif code == 200 and ("json" in headers.get("content-type", "") or (

@@ -40,7 +40,7 @@ wait_apt_idle() {
 XUI_VERSION="v3.9.0"
 # SHA256 установщика 3X-UI закреплённой версии для контроля целостности.
 XUI_INSTALL_SHA256="18616fe26c8f6c92db6daa2dcd7cd53c5143ee69ecfd26d8ea6dc9b2c78607a6"
-WAGA_VERSION="1.3.0"
+WAGA_VERSION="1.3.1"
 # Файлы waga и waga-sub берутся из репозитория WAGA.
 WAGA_RAW="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main"
 # Ядро Xray для панели. С 26.7.x клиенты на Mihomo и sing-box (Hiddify, FlClash,
@@ -1821,12 +1821,12 @@ setup_subscription() {
       .subEnable = true | .subPath = $path | .subTitle = $title | .subListen = "127.0.0.1" | .subPort = $ip
       | .subURI = $uri
       | .subCertFile = "" | .subKeyFile = ""
-      | .subClashEnable = true | .subClashAutoDetect = true | .subJsonEnable = true | .subJsonAutoDetect = true' <<<"$all")
+      | .subClashEnable = true | .subClashAutoDetect = true | .subJsonEnable = true | .subJsonAutoDetect = true | .subEmailInRemark = false | .remarkModel = "-i" | .remarkTemplate = "{{INBOUND}}"' <<<"$all")
   else
     SUB_PORT=$(jq -r '.subPort // 2096' <<<"$all")
     upd=$(jq -c --arg path "$SUB_PATH" --arg title "Дядя Вова VPN" '
       .subEnable = true | .subPath = $path | .subTitle = $title
-      | .subClashEnable = true | .subClashAutoDetect = true | .subJsonEnable = true | .subJsonAutoDetect = true' <<<"$all")
+      | .subClashEnable = true | .subClashAutoDetect = true | .subJsonEnable = true | .subJsonAutoDetect = true | .subEmailInRemark = false | .remarkModel = "-i" | .remarkTemplate = "{{INBOUND}}"' <<<"$all")
   fi
   if [[ $upd != "$all" ]]; then
     api POST setting/update "$upd" >/dev/null
