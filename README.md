@@ -1,7 +1,8 @@
-<div align="center">
 
 <!-- Замените путь ниже на вашу обложку, если она называется иначе -->
-<img src="banner.jpg" alt="WAGA · Дядя Вова VPN" width="100%" />
+<img width="1024" height="339" alt="3f68ff0f-bbae-4882-a407-09623a9a0bfe" src="https://github.com/user-attachments/assets/d5b70e47-fbd3-4242-8a63-f19b1a9e8fad" />
+<div align="center">
+
 
 # 🚀 WAGA · Дядя Вова VPN
 
