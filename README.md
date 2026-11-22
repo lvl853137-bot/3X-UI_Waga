@@ -1,4 +1,4 @@
-# 🚀 WAGA · Дядя Вова VPN
+# 🚀 WAGA · Дядя Вова VPN (v1.4.0)
 
 Собственная система развёртывания и управления VPN на базе **3X-UI v3.9.0 + Xray v26.6.27 + Nginx (SNI 443) + waga-sub**.
 
@@ -14,8 +14,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/mai
 - **VLESS XHTTP + REALITY** (`443/tcp`)
 - **AmneziaWG** (`51821/udp`) и **AmneziaWG 3.1** (`51822/udp`)
 
+## Маршрутизация Happ и Incy по умолчанию (v1.4.0)
+Сервис подписки `waga-sub` автоматически отдаёт в заголовках подписки `Routing` и `Routing-Enable: 1` готовый профиль маршрутизации **RoscomVPN** для клиентов **Happ** и **Incy**:
+- **DNS:** DoH `77.88.8.8` (РФ) + DoH `8.8.8.8` (зарубежные домены), плюс статические записи `lkfl2.nalog.ru` / `lknpd.nalog.ru`.
+- **Напрямую (`Direct`):** `geosite:private`, `geosite:category-ru`, `geosite:whitelist`, `microsoft`, `apple`, `steam`, `epicgames`, `riot`, `twitch`, `pinterest`, `faceit`, `geoip:private`, `geoip:direct`.
+- **Через VPN (`Proxy`):** `youtube`, `telegram`, `github`, `google-play`, `twitch-ads` и все остальные зарубежные сайты (`GlobalProxy: true`).
+- **Блокировка (`Block`):** `geosite:win-spy`, `geosite:torrent`, `geosite:category-ads`.
+- **Управление:** `waga → 2 → 15` (`waga net happ`) или файл `/etc/waga-sub/happ_routing.txt` (можно подставить свою ссылку `happ://routing/...` или записать `off`, чтобы отключить).
+
 ## Встроенные домены GEMINI
-Автоматически прописываются в `xrayTemplateConfig` панели 3X-UI, в шаблон `/etc/waga-sub/rules.yaml` и в браузерный генератор роутеров (`tools/`):
+Автоматически прописываются в `xrayTemplateConfig` панели 3X-UI, в `/etc/waga-sub/rules.yaml` и в генератор роутеров (`tools/`):
 - `geosite:google-gemini`
 - `domain:gemini.google.com`
 - `domain:aistudio.google.com`
@@ -28,86 +36,52 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/mai
 - `waga check --deep` / `waga fix` — диагностика сервера и безопасное автоисправление
 - `waga net gemini ipv4|warp|direct` — переключение маршрута доменов Gemini
 - `waga net awg classic|mid|full` — переключение обфускации AmneziaWG
-- `waga net happ` — редактирование баннера `announce.txt` и внешних нод `extra_nodes.txt`
+- `waga net happ` — баннер `announce.txt`, внешние ноды `extra_nodes.txt` и маршрутизация Happ/Incy
+- `waga speed` / `waga res` / `waga online` — тест скорости, ресурсы сервера и активные подключения
 - `waga backup` / `waga uninstall` — резервная копия и полное удаление
 
-## Защита и оптимизация сервера (`waga` → пункт `4` / `waga sec`)
-Все модули ставятся и включаются вручную через меню **`WAGA · Дядя Вова VPN – управление сервером → 4. Защита и оптимизация сервера`**:
-- **Fail2ban с защитой от самобана** (`waga sec fail2ban`) — джейлы `sshd` + `nginx` (сканеры 404/444 и лимиты) + интерактивное управление белым списком `ignoreip`.
-- **Сетевой тюнинг ядра `sysctl`** (`waga sec sysctl`) — `BBR` + `fq`, UDP-буферы 16 МБ (`rmem_max`/`wmem_max`) для Hysteria2/AmneziaWG, `tcp_syncookies`, `rp_filter`, отключение ICMP-редиректов.
-- **Автообновления безопасности ОС** (`waga sec updates`) — `unattended-upgrades` только для security-патчей, без автоперезагрузки и без затрагивания `x-ui`/`xray`.
-- **Автообновление домена** (`waga sec domain`) — systemd-таймер DDNS (DuckDNS или свой HTTPS URL каждые 5 минут) + проверка и продление TLS-сертификата (`acme.sh`).
-- **Rate limiting в Nginx** (`waga sec ratelimit`) — `limit_req_zone` (`5r/s`, `burst=10`) и `limit_conn` на панель и `waga-sub` (с исключением `127.0.0.1` для `waga check`).
-- **2FA (TOTP) в панели 3X-UI** (`waga sec 2fa`) — генерация ключа, вывод QR-кода для Google Authenticator / Bitwarden, проверка 6-значного кода перед активацией и аварийное отключение.
-- **Жёсткие заголовки и сброс `444` в Nginx** (`waga sec headers`) — security-заголовки, запрет всех HTTP-методов кроме `GET/POST/HEAD` и тихий сброс `444` при запросах по чужому `Host` / прямому IP.
-
-## Миграция, WARP и SSH-туннели (v1.2.0)
-- **Безопасный импорт клиентов из старой БД** (`waga user import /root/old.db` или `waga → 1 → 7`) — переносит только пользователей и их `subId`/`UUID`/лимиты, не ломая настройки сервера.
-- **Совместимость старого пути `/sub/`** (`waga net sub-legacy on|off` или `waga → 2 → 16`) — старые ссылки `/sub/<subId>` продолжают работать через `waga-sub`.
-- **Автоустановка Cloudflare WARP (`127.0.0.1:40000`)** (`waga net warp install` или `waga → 2 → 13`) — локальный SOCKS5-прокси для Gemini без изменения системных маршрутов.
-- **Автопроверка и починка DNS** — при установке и в `waga check` / `waga fix`.
-- **SSH-туннель между двумя VPS без VPN/tun** (`waga sec tunnel` или `waga → 4 → 9`) — TCP-проброс (`relay`) и обратный SSH-туннель (`reverse`) со сменой портов.
-
-## Новое в v1.3.0
-- **Дизайнерское меню `waga`**: ASCII-логотип, цветная рамка, статус-панель (IP, маскировка, Xray, клиенты, RAM, диск) и краткие пояснения в скобках для каждой команды.
-- **Мониторинг (`waga → 3`)**: тест скорости канала (`waga speed`), потребление CPU/RAM/диска (`waga res`), живые подключения и топ трафика (`waga online`).
-- **Защита (`waga → 4`)**: блокировка исходящих SMTP-портов 25/465/587 (`waga sec smtp`), авторотация SNI по таймеру (`waga sec sni-auto`), проверка чистоты IP по DNSBL (`waga sec ip-check`).
-- **Брендирование подписки (`waga → 2 → 17` / `waga net brand`)**: название подписки, ссылка поддержки Telegram и своя HTML-заглушка.
+## Защита и оптимизация сервера (`waga → 4` / `waga sec`)
+- **Fail2ban с защитой от самобана** (`waga sec fail2ban`) — джейлы `sshd` + `nginx` + белый список `ignoreip`.
+- **Тюнинг ядра `sysctl`** (`waga sec sysctl`) — `BBR` + `fq`, UDP-буферы 16 МБ (`rmem_max`/`wmem_max`) для Hysteria2/AmneziaWG, защита TCP.
+- **Автообновления безопасности ОС** (`waga sec updates`) — только security-патчи без перезагрузки.
+- **Автообновление домена** (`waga sec domain`) — DDNS (DuckDNS или свой HTTPS URL) + продление TLS.
+- **Rate limiting и заголовки Nginx** (`waga sec ratelimit`, `waga sec headers`) — защита панели и тихий сброс `444`.
+- **2FA (TOTP) в 3X-UI** (`waga sec 2fa`) — вход в панель по коду с телефона.
+- **SSH-туннель между VPS** (`waga sec tunnel` / `waga → 4 → 9`) — TCP-проброс (`relay`) и обратный туннель (`reverse`).
+- **Защита от абуз и детекта** (`waga sec smtp`, `waga sec sni-auto`, `waga sec ip-check`) — блок SMTP 25/465/587, плановая ротация SNI и проверка IP по DNSBL.
 
 ---
 
-## Каскадное подключение между VPS (`waga sec cascade`)
+## Каскадное подключение между VPS (`waga sec cascade` / `waga → 4 → 13`)
 
-Используется, когда прямой доступ к выходному VPS (например, из мобильных сетей или по IP/SNI) работает нестабильно, а промежуточный VPS (точка входа) доступен стабильно.
+Помогает обойти блокировки мобильных операторов (МТС, Билайн, Yota, Т2, МегаФон), когда прямой доступ к выходному VPS нестабилен, а промежуточный VPS (точка входа) доступен стабильно.
 
-### 1. Поднятие моста на сервере-посреднике (Entry VPS)
-
-Меню: **`waga` → `4. Защита и оптимизация` → `13. Каскадное подключение`** или командой:
+### 1. Поднятие моста на входном VPS (Entry VPS)
 
 ```bash
-waga sec cascade add <имя_моста> <порт_на_входе> <IP_или_домен_выхода> <порт_на_выходе> [both|tcp|udp]
+waga sec cascade add <имя> <порт_на_входе> <IP_выхода> <порт_на_выходе> [both|tcp|udp]
 ```
 
-Пример (`Швеция` пробрасывает `8443` TCP+UDP на `Македонию` `138.124.252.98:443`):
+Пример (`Швеция` пробрасывает `8443` TCP + UDP на `Македонию` `138.124.252.98:443`):
 
 ```bash
 waga sec cascade add mk 8443 138.124.252.98 443 both
 ```
 
-Команда создаёт и запускает `waga-cascade-<имя>-tcp.service` и `waga-cascade-<имя>-udp.service` (с `UDP4-LISTEN` для совместимости со свежими ядрами и `socat`) и открывает порт в `ufw`.
+Команда создаёт службы `waga-cascade-<имя>-tcp.service` и `waga-cascade-<имя>-udp.service` (с `UDP4-LISTEN`) и открывает порты в `ufw`.
 
-Управление и удаление:
+### 2. Автопривязка инбаундов и подписки одной командой (v1.4.0)
+
+Вместо ручной правки JSON и SQLite достаточно выполнить (или выбрать пункт **`3`** в `waga → 4 → 13`):
 
 ```bash
-waga sec cascade            # список мостов и статус служб
-waga sec cascade del mk     # удалить мост и закрыть порт в ufw
+waga sec cascade bind bonbon.zanity.net 8443 Македония
 ```
 
-### 2. Переключение инбаундов и подписки на `bonbon.zanity.net:8443`
+Команда сделает резервную копию `/etc/x-ui/x-ui.db`, обновит `externalProxy` и таблицу `hosts` для подходящих записей и перезапустит `x-ui`.
 
-1. В карточке инбаунда на вкладке **«Расширенный шаблон»** задайте `externalProxy`:
-   ```json
-   "externalProxy": [
-     {
-       "forceTls": "same",
-       "dest": "bonbon.zanity.net",
-       "port": 8443,
-       "remark": ""
-     }
-   ]
-   ```
-2. Если подписка на панели-агрегаторе подтягивает адреса из таблицы `hosts` для синхронизированных узлов, обновите `address` и `port` в `/etc/x-ui/x-ui.db` и перезапустите `x-ui`:
-   ```bash
-   python3 - <<'PY'
-   import sqlite3
-   db = sqlite3.connect("/etc/x-ui/x-ui.db")
-   cols = [c[1] for c in db.execute("PRAGMA table_info(hosts)")]
-   q = "UPDATE hosts SET address=?, port=?" if "port" in cols else "UPDATE hosts SET address=?"
-   params = ("bonbon.zanity.net", 8443) if "port" in cols else ("bonbon.zanity.net",)
-   db.execute(q, params)
-   db.commit()
-   db.close()
-   PY
-   systemctl restart x-ui
-   ```
-3. Синхронизируйте узел в панели (если нужно) и обновите подписку в клиенте (например, **Happ**).
+### 3. Рекомендации против блокировок мобильных операторов
+- Используйте **каскад (Entry VPS → Exit VPS)** для проблемных локаций: клиенты подключаются к стабильному входному IP/домену, а выходят в интернет с нужной страны.
+- Держите включённым **тюнинг ядра** (`waga sec sysctl on` — BBR + UDP 16 МБ) на обоих серверах.
+- Для **VLESS REALITY / XHTTP** выбирайте чистый, реально отвечающий по TLS 1.3 SNI (`waga sec sni-auto`) и избегайте заблокированных подсетей.
+- Для **Hysteria2** и **VLESS XHTTP** держите их в подписке как запасные транспорты на случай троттлинга TCP или UDP отдельным оператором.

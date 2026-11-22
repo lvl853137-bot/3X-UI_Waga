@@ -40,7 +40,7 @@ wait_apt_idle() {
 XUI_VERSION="v3.9.0"
 # SHA256 установщика 3X-UI закреплённой версии для контроля целостности.
 XUI_INSTALL_SHA256="18616fe26c8f6c92db6daa2dcd7cd53c5143ee69ecfd26d8ea6dc9b2c78607a6"
-WAGA_VERSION="1.3.3"
+WAGA_VERSION="1.4.0"
 # Файлы waga и waga-sub берутся из репозитория WAGA.
 WAGA_RAW="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main"
 # Ядро Xray для панели. С 26.7.x клиенты на Mihomo и sing-box (Hiddify, FlClash,
@@ -1883,6 +1883,8 @@ install_waga_sub_file() {
   install -d -m 755 /usr/local/lib/waga-sub /etc/waga-sub
   touch /etc/waga-sub/announce.txt /etc/waga-sub/extra_nodes.txt
   chmod 644 /etc/waga-sub/announce.txt /etc/waga-sub/extra_nodes.txt
+  [[ -s /etc/waga-sub/happ_routing.txt ]] || printf '%s\n' "happ://routing/add/eyJEb21lc3RpY0ROU0RvbWFpbiI6Imh0dHBzOlwvXC83Ny44OC44LjhcL2Rucy1xdWVyeSIsIlJlbW90ZUROU0lwIjoiOC44LjguOCIsIlJlbW90ZUROU1R5cGUiOiJEb0giLCJHZW9zaXRlVXJsIjoiaHR0cHM6XC9cL2Nkbi5qc2RlbGl2ci5uZXRcL2doXC9oeWRyYXBvbmlxdWVcL3Jvc2NvbXZwbi1nZW9zaXRlQDIwMjYwNDE1MjIzNVwvcmVsZWFzZVwvZ2Vvc2l0ZS5kYXQiLCJHZW9pcFVybCI6Imh0dHBzOlwvXC9jZG4uanNkZWxpdnIubmV0XC9naFwvaHlkcmFwb25pcXVlXC9yb3Njb212cG4tZ2VvaXBAMjAyNjA0MTYwNTM3XC9yZWxlYXNlXC9nZW9pcC5kYXQiLCJEaXJlY3RTaXRlcyI6WyJnZW9zaXRlOnByaXZhdGUiLCJnZW9zaXRlOmNhdGVnb3J5LXJ1IiwiZ2Vvc2l0ZTp3aGl0ZWxpc3QiLCJnZW9zaXRlOm1pY3Jvc29mdCIsImdlb3NpdGU6YXBwbGUiLCJnZW9zaXRlOmVwaWNnYW1lcyIsImdlb3NpdGU6cmlvdCIsImdlb3NpdGU6ZXNjYXBlZnJvbXRhcmtvdiIsImdlb3NpdGU6c3RlYW0iLCJnZW9zaXRlOnR3aXRjaCIsImdlb3NpdGU6cGludGVyZXN0IiwiZ2Vvc2l0ZTpmYWNlaXQiXSwiR2xvYmFsUHJveHkiOnRydWUsIlJlbW90ZUROU0RvbWFpbiI6Imh0dHBzOlwvXC84LjguOC44XC9kbnMtcXVlcnkiLCJQcm94eVNpdGVzIjpbImdlb3NpdGU6Z29vZ2xlLXBsYXkiLCJnZW9zaXRlOmdpdGh1YiIsImdlb3NpdGU6dHdpdGNoLWFkcyIsImdlb3NpdGU6eW91dHViZSIsImdlb3NpdGU6dGVsZWdyYW0iXSwiUHJveHlJcCI6W10sIkRvbWVzdGljRE5TVHlwZSI6IkRvSCIsIkRvbWVzdGljRE5TSXAiOiI3Ny44OC44LjgiLCJEbnNIb3N0cyI6eyJsa2ZsMi5uYWxvZy5ydSI6IjIxMy4yNC42NC4xNzUiLCJsa25wZC5uYWxvZy5ydSI6IjIxMy4yNC42NC4xODEifSwiQmxvY2tTaXRlcyI6WyJnZW9zaXRlOndpbi1zcHkiLCJnZW9zaXRlOnRvcnJlbnQiLCJnZW9zaXRlOmNhdGVnb3J5LWFkcyJdLCJCbG9ja0lwIjpbXSwiTGFzdFVwZGF0ZWQiOjAsIkZha2VEbnMiOmZhbHNlLCJOYW1lIjoiUm9zY29tVlBOIiwiRGlyZWN0SXAiOlsiZ2VvaXA6cHJpdmF0ZSIsImdlb2lwOmRpcmVjdCJdLCJEb21haW5TdHJhdGVneSI6IklQSWZOb25NYXRjaCIsIlJvdXRlT3JkZXIiOiJibG9jay1wcm94eS1kaXJlY3QiLCJVc2VDaHVua0ZpbGVzIjp0cnVlfQ==" >/etc/waga-sub/happ_routing.txt
+  chmod 644 /etc/waga-sub/happ_routing.txt
   local src=${WAGA_SUB_SRC:-}
   if [[ -z $src ]]; then
     local d; d=$(dirname "${BASH_SOURCE[0]}")
@@ -2111,7 +2113,7 @@ restore_main() { # файл
   trap "rm -rf -- '$tmp'" EXIT
   python3 - "$file" "$tmp" <<'PY' || die "Это не резервная копия WAGA · Дядя Вова VPN или она повреждена. Ничего не менял."
 import os, sys, tarfile, unicodedata
-allowed = ("etc/x-ui/x-ui.db", "etc/x-ui/install-result.env", "etc/waga/waga.env", "etc/waga/ddns.env", "etc/waga-sub/config.json", "etc/waga-sub/rules.yaml", "etc/waga-sub/announce.txt", "etc/waga-sub/extra_nodes.txt",
+allowed = ("etc/x-ui/x-ui.db", "etc/x-ui/install-result.env", "etc/waga/waga.env", "etc/waga/ddns.env", "etc/waga-sub/config.json", "etc/waga-sub/rules.yaml", "etc/waga-sub/announce.txt", "etc/waga-sub/extra_nodes.txt", "etc/waga-sub/happ_routing.txt",
            "etc/nginx/waga-stream.conf", "etc/nginx/conf.d/waga.conf", "var/www/waga", "root/cert/self",
            "root/cert/custom", "root/waga.txt", "waga-backup.env")
 parents = {"etc", "etc/x-ui", "etc/waga", "etc/waga-sub", "etc/nginx", "etc/nginx/conf.d", "var", "var/www", "root", "root/cert"}
@@ -2269,6 +2271,7 @@ PY
   install -d -m 755 /etc/waga-sub  # waga-sub (без root) читает rules.yaml
   [[ -f $tmp/etc/waga-sub/rules.yaml ]] && install -m 644 "$tmp/etc/waga-sub/rules.yaml" /etc/waga-sub/rules.yaml
   [[ -f $tmp/etc/waga-sub/announce.txt ]] && install -m 644 "$tmp/etc/waga-sub/announce.txt" /etc/waga-sub/announce.txt
+  [[ -f $tmp/etc/waga-sub/happ_routing.txt ]] && install -m 644 "$tmp/etc/waga-sub/happ_routing.txt" /etc/waga-sub/happ_routing.txt
   [[ -f $tmp/etc/waga-sub/extra_nodes.txt ]] && install -m 644 "$tmp/etc/waga-sub/extra_nodes.txt" /etc/waga-sub/extra_nodes.txt
   [[ -f $tmp/etc/waga/waga.env ]] && install -m 600 "$tmp/etc/waga/waga.env" /etc/waga/waga.env
   [[ -f $tmp/etc/waga/ddns.env ]] && install -m 600 "$tmp/etc/waga/ddns.env" /etc/waga/ddns.env

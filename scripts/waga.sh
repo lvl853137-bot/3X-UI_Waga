@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 export LC_ALL=C.UTF-8  # ширина колонок по символам, а не байтам
 
-WAGA_VERSION="1.3.3"
+WAGA_VERSION="1.4.0"
 WAGA_RAW="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main"
 # Файлы новой версии берём из её тега, а не из меняющейся ветки main.
 waga_ref_raw() { echo "https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/v$1"; }
@@ -1452,16 +1452,53 @@ net_awg_obf() {
   say "Обфускация AmneziaWG (ID $id) → ${B}$mode${N}."
 }
 
+DEFAULT_HAPP_ROUTING="happ://routing/add/eyJEb21lc3RpY0ROU0RvbWFpbiI6Imh0dHBzOlwvXC83Ny44OC44LjhcL2Rucy1xdWVyeSIsIlJlbW90ZUROU0lwIjoiOC44LjguOCIsIlJlbW90ZUROU1R5cGUiOiJEb0giLCJHZW9zaXRlVXJsIjoiaHR0cHM6XC9cL2Nkbi5qc2RlbGl2ci5uZXRcL2doXC9oeWRyYXBvbmlxdWVcL3Jvc2NvbXZwbi1nZW9zaXRlQDIwMjYwNDE1MjIzNVwvcmVsZWFzZVwvZ2Vvc2l0ZS5kYXQiLCJHZW9pcFVybCI6Imh0dHBzOlwvXC9jZG4uanNkZWxpdnIubmV0XC9naFwvaHlkcmFwb25pcXVlXC9yb3Njb212cG4tZ2VvaXBAMjAyNjA0MTYwNTM3XC9yZWxlYXNlXC9nZW9pcC5kYXQiLCJEaXJlY3RTaXRlcyI6WyJnZW9zaXRlOnByaXZhdGUiLCJnZW9zaXRlOmNhdGVnb3J5LXJ1IiwiZ2Vvc2l0ZTp3aGl0ZWxpc3QiLCJnZW9zaXRlOm1pY3Jvc29mdCIsImdlb3NpdGU6YXBwbGUiLCJnZW9zaXRlOmVwaWNnYW1lcyIsImdlb3NpdGU6cmlvdCIsImdlb3NpdGU6ZXNjYXBlZnJvbXRhcmtvdiIsImdlb3NpdGU6c3RlYW0iLCJnZW9zaXRlOnR3aXRjaCIsImdlb3NpdGU6cGludGVyZXN0IiwiZ2Vvc2l0ZTpmYWNlaXQiXSwiR2xvYmFsUHJveHkiOnRydWUsIlJlbW90ZUROU0RvbWFpbiI6Imh0dHBzOlwvXC84LjguOC44XC9kbnMtcXVlcnkiLCJQcm94eVNpdGVzIjpbImdlb3NpdGU6Z29vZ2xlLXBsYXkiLCJnZW9zaXRlOmdpdGh1YiIsImdlb3NpdGU6dHdpdGNoLWFkcyIsImdlb3NpdGU6eW91dHViZSIsImdlb3NpdGU6dGVsZWdyYW0iXSwiUHJveHlJcCI6W10sIkRvbWVzdGljRE5TVHlwZSI6IkRvSCIsIkRvbWVzdGljRE5TSXAiOiI3Ny44OC44LjgiLCJEbnNIb3N0cyI6eyJsa2ZsMi5uYWxvZy5ydSI6IjIxMy4yNC42NC4xNzUiLCJsa25wZC5uYWxvZy5ydSI6IjIxMy4yNC42NC4xODEifSwiQmxvY2tTaXRlcyI6WyJnZW9zaXRlOndpbi1zcHkiLCJnZW9zaXRlOnRvcnJlbnQiLCJnZW9zaXRlOmNhdGVnb3J5LWFkcyJdLCJCbG9ja0lwIjpbXSwiTGFzdFVwZGF0ZWQiOjAsIkZha2VEbnMiOmZhbHNlLCJOYW1lIjoiUm9zY29tVlBOIiwiRGlyZWN0SXAiOlsiZ2VvaXA6cHJpdmF0ZSIsImdlb2lwOmRpcmVjdCJdLCJEb21haW5TdHJhdGVneSI6IklQSWZOb25NYXRjaCIsIlJvdXRlT3JkZXIiOiJibG9jay1wcm94eS1kaXJlY3QiLCJVc2VDaHVua0ZpbGVzIjp0cnVlfQ=="
+
 net_happ() {
   install -d -m 755 /etc/waga-sub
   touch /etc/waga-sub/announce.txt /etc/waga-sub/extra_nodes.txt
   chmod 644 /etc/waga-sub/announce.txt /etc/waga-sub/extra_nodes.txt
+  local rt_state="по умолчанию (RoscomVPN)"
+  if [[ -f /etc/waga-sub/happ_routing.txt ]]; then
+    local cur; cur=$(tr -d '\r\n' </etc/waga-sub/happ_routing.txt 2>/dev/null || true)
+    case "${cur,,}" in
+      ""|off|none|disabled|0) rt_state="выключена (off)" ;;
+      *) rt_state="включена (/etc/waga-sub/happ_routing.txt)" ;;
+    esac
+  fi
   echo "1. Баннер Happ: /etc/waga-sub/announce.txt"
   echo "2. Внешние VPS: /etc/waga-sub/extra_nodes.txt"
-  ask_num "1 – баннер, 2 – внешние ноды, Enter – назад: "
+  echo "3. Маршрутизация Happ / Incy: ${B}${rt_state}${N}"
+  ask_num "1 – баннер, 2 – внешние ноды, 3 – маршрутизация Happ/Incy, Enter – назад: "
   case $REPLY in
     1) ${EDITOR:-nano} /etc/waga-sub/announce.txt; chmod 644 /etc/waga-sub/announce.txt ;;
     2) ${EDITOR:-nano} /etc/waga-sub/extra_nodes.txt; chmod 644 /etc/waga-sub/extra_nodes.txt ;;
+    3)
+      echo
+      echo "  1. Включить профиль по умолчанию (RoscomVPN: РФ direct, YT/TG/GitHub proxy)"
+      echo "  2. Вставить свою ссылку happ://routing/..."
+      echo "  3. Отключить маршрутизацию по умолчанию (off)"
+      ask_num "Выбор [1-3]: "
+      case $REPLY in
+        1)
+          printf '%s\n' "$DEFAULT_HAPP_ROUTING" >/etc/waga-sub/happ_routing.txt
+          chmod 644 /etc/waga-sub/happ_routing.txt
+          say "Маршрутизация Happ/Incy по умолчанию (RoscomVPN) включена."
+          ;;
+        2)
+          ask_tty "Вставьте ссылку happ://routing/... : "
+          [[ -n $REPLY ]] || die "Пустая строка."
+          printf '%s\n' "$REPLY" >/etc/waga-sub/happ_routing.txt
+          chmod 644 /etc/waga-sub/happ_routing.txt
+          say "Своя маршрутизация Happ/Incy сохранена."
+          ;;
+        3)
+          printf 'off\n' >/etc/waga-sub/happ_routing.txt
+          chmod 644 /etc/waga-sub/happ_routing.txt
+          say "Маршрутизация Happ/Incy по умолчанию отключена."
+          ;;
+      esac
+      ;;
   esac
 }
 
@@ -5056,9 +5093,9 @@ sec_cascade_list() {
     found=1
     name=${f##*/waga-cascade-}; name=${name%.service}
     st=$(systemctl is-active "waga-cascade-${name}.service" 2>/dev/null || echo inactive)
-    proto=$(grep -oE 'TCP-LISTEN|UDP-LISTEN' "$f" | head -n1)
-    [[ $proto == UDP-LISTEN ]] && proto="UDP" || proto="TCP"
-    lport=$(grep -oE '(TCP|UDP)-LISTEN:[0-9]+' "$f" | head -n1 | cut -d: -f2)
+    proto=$(grep -oE 'TCP-LISTEN|UDP4?-LISTEN' "$f" | head -n1)
+    [[ $proto == UDP* ]] && proto="UDP" || proto="TCP"
+    lport=$(grep -oE '(TCP|UDP4?)-LISTEN:[0-9]+' "$f" | head -n1 | cut -d: -f2)
     target=$(grep -oE '(TCP|UDP):[^ ]+' "$f" | tail -n1 | cut -d: -f2-)
     if [[ $st == active ]]; then
       echo "  ✅ ${B}${name}${N} [${proto}] :${lport} → ${target}  ${G}(работает)${N}"
@@ -5143,7 +5180,7 @@ sec_cascade_del() {
     f="/etc/systemd/system/waga-cascade-${name}-${p}.service"
     [[ -f $f ]] || continue
     found=1
-    lport=$(grep -oE '(TCP|UDP)-LISTEN:[0-9]+' "$f" | head -n1 | cut -d: -f2)
+    lport=$(grep -oE '(TCP|UDP4?)-LISTEN:[0-9]+' "$f" | head -n1 | cut -d: -f2)
     systemctl disable --now "waga-cascade-${name}-${p}.service" >/dev/null 2>&1 || true
     rm -f "$f"
     [[ -n $lport ]] && command -v ufw >/dev/null 2>&1 && ufw delete allow "${lport}/${p}" >/dev/null 2>&1 || true
@@ -5156,14 +5193,75 @@ sec_cascade_del() {
   fi
 }
 
+
+sec_cascade_bind() {
+  local dest=${1:-} port=${2:-} flt=${3:-}
+  [[ -n $dest ]] || die "Укажите адрес/домен входного VPS (напр. bonbon.zanity.net)."
+  [[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]] || die "Укажите порт моста (напр. 8443)."
+  [[ -f /etc/x-ui/x-ui.db ]] || die "База /etc/x-ui/x-ui.db не найдена."
+  cp -a /etc/x-ui/x-ui.db "/etc/x-ui/x-ui.db.bak-cascade-$(date +%Y%m%d%H%M%S)"
+  python3 - "$dest" "$port" "$flt" <<'PY'
+import json, sqlite3, sys
+
+dest, port, flt = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+db = sqlite3.connect("/etc/x-ui/x-ui.db")
+db.row_factory = sqlite3.Row
+upd_inb = 0
+upd_hosts = 0
+
+q = "SELECT id, remark, stream_settings FROM inbounds"
+params = ()
+if flt:
+    q += " WHERE remark LIKE ?"
+    params = (f"%{flt}%",)
+
+for r in db.execute(q, params):
+    st = json.loads(r["stream_settings"] or "{}")
+    ep = st.get("externalProxy")
+    if not isinstance(ep, list) or not ep:
+        ep = [{"forceTls": "same", "dest": dest, "port": port, "remark": ""}]
+    else:
+        for item in ep:
+            item["dest"] = dest
+            item["port"] = port
+            item.setdefault("forceTls", "same")
+            item.setdefault("remark", "")
+    st["externalProxy"] = ep
+    db.execute("UPDATE inbounds SET stream_settings=? WHERE id=?", (json.dumps(st, ensure_ascii=False), r["id"]))
+    upd_inb += 1
+
+tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+if "hosts" in tables:
+    cols = [c[1] for c in db.execute("PRAGMA table_info(hosts)")]
+    if flt:
+        hq = "SELECT id, address, remark FROM hosts WHERE address LIKE ? OR remark LIKE ?"
+        hrows = db.execute(hq, (f"%{flt}%", f"%{flt}%")).fetchall()
+    else:
+        hrows = db.execute("SELECT id, address, remark FROM hosts").fetchall()
+    for hr in hrows:
+        if "port" in cols:
+            db.execute("UPDATE hosts SET address=?, port=? WHERE id=?", (dest, port, hr["id"]))
+        else:
+            db.execute("UPDATE hosts SET address=? WHERE id=?", (dest, hr["id"]))
+        upd_hosts += 1
+
+db.commit()
+db.close()
+print(f"Обновлено inbounds: {upd_inb}, записей hosts: {upd_hosts}")
+PY
+  systemctl restart x-ui
+  say "Привязка к мосту ${dest}:${port} применена (x-ui перезапущен)."
+}
+
 s_cascade() {
   local c name lport tip tport proto
   sec_cascade_list
   echo
   echo "  1. Создать каскадный мост ${D}(порт этого VPS → порт второго VPS: TCP + UDP)${N}"
   echo "  2. Удалить каскадный мост"
+  echo "  3. Привязать 3X-UI к мосту ${D}(обновить externalProxy и hosts в x-ui.db)${N}"
   echo "  0. Назад"
-  ask_num "Выбор [0-2]: "; c=$REPLY
+  ask_num "Выбор [0-3]: "; c=$REPLY
   case $c in
     1)
       ask_tty "Имя моста (напр. mk): "; name=${REPLY//[[:space:]]/}
@@ -5176,6 +5274,12 @@ s_cascade() {
     2)
       ask_tty "Имя моста для удаления (без -tcp/-udp): "; name=${REPLY//[[:space:]]/}
       sec_cascade_del "$name"
+      ;;
+    3)
+      ask_tty "Домен или IP входного VPS (напр. bonbon.zanity.net): "; tip=${REPLY//[[:space:]]/}
+      ask_tty "Порт моста (напр. 8443): "; lport=${REPLY//[[:space:]]/}
+      ask_tty "Фильтр по названию/хосту (напр. Македония, Enter – все): "; name=${REPLY}
+      sec_cascade_bind "$tip" "$lport" "$name"
       ;;
   esac
 }
@@ -5228,7 +5332,7 @@ cmd_sec() {
       case ${1:-status} in weekly|monthly) sec_sni_auto_on "$1" ;; off) sec_sni_auto_off ;; *) sec_sni_auto_status ;; esac ;;
     ip-check) sec_ip_check ;;
     cascade)
-      case ${1:-list} in add) shift; sec_cascade_add "$@" ;; del) sec_cascade_del "${2:-}" ;; *) sec_cascade_list ;; esac ;;
+      case ${1:-list} in add) shift; sec_cascade_add "$@" ;; del) sec_cascade_del "${2:-}" ;; bind) shift; sec_cascade_bind "$@" ;; *) sec_cascade_list ;; esac ;;
     *) die "waga sec [status | fail2ban | sysctl | updates | domain | ratelimit | 2fa | headers]" ;;
   esac
 }

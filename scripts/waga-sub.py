@@ -81,6 +81,16 @@ EXTRA = ["/" + x.strip("/") + "/" for x in CONF.get("extra_paths", []) if isinst
 # случайно из списка. Карта «прежнее имя → нынешнее» от waga: в подписку уходит только нынешнее. Нет файла – ничего не меняем.
 GRACE_FILE = os.environ.get("WAGA_SUB_GRACE") or "/etc/waga-sub/sni-grace.json"
 ANNOUNCE_FILE = os.environ.get("WAGA_SUB_ANNOUNCE") or "/etc/waga-sub/announce.txt"
+ROUTING_FILE = os.environ.get("WAGA_SUB_ROUTING") or "/etc/waga-sub/happ_routing.txt"
+DEFAULT_HAPP_ROUTING = "happ://routing/add/eyJEb21lc3RpY0ROU0RvbWFpbiI6Imh0dHBzOlwvXC83Ny44OC44LjhcL2Rucy1xdWVyeSIsIlJlbW90ZUROU0lwIjoiOC44LjguOCIsIlJlbW90ZUROU1R5cGUiOiJEb0giLCJHZW9zaXRlVXJsIjoiaHR0cHM6XC9cL2Nkbi5qc2RlbGl2ci5uZXRcL2doXC9oeWRyYXBvbmlxdWVcL3Jvc2NvbXZwbi1nZW9zaXRlQDIwMjYwNDE1MjIzNVwvcmVsZWFzZVwvZ2Vvc2l0ZS5kYXQiLCJHZW9pcFVybCI6Imh0dHBzOlwvXC9jZG4uanNkZWxpdnIubmV0XC9naFwvaHlkcmFwb25pcXVlXC9yb3Njb212cG4tZ2VvaXBAMjAyNjA0MTYwNTM3XC9yZWxlYXNlXC9nZW9pcC5kYXQiLCJEaXJlY3RTaXRlcyI6WyJnZW9zaXRlOnByaXZhdGUiLCJnZW9zaXRlOmNhdGVnb3J5LXJ1IiwiZ2Vvc2l0ZTp3aGl0ZWxpc3QiLCJnZW9zaXRlOm1pY3Jvc29mdCIsImdlb3NpdGU6YXBwbGUiLCJnZW9zaXRlOmVwaWNnYW1lcyIsImdlb3NpdGU6cmlvdCIsImdlb3NpdGU6ZXNjYXBlZnJvbXRhcmtvdiIsImdlb3NpdGU6c3RlYW0iLCJnZW9zaXRlOnR3aXRjaCIsImdlb3NpdGU6cGludGVyZXN0IiwiZ2Vvc2l0ZTpmYWNlaXQiXSwiR2xvYmFsUHJveHkiOnRydWUsIlJlbW90ZUROU0RvbWFpbiI6Imh0dHBzOlwvXC84LjguOC44XC9kbnMtcXVlcnkiLCJQcm94eVNpdGVzIjpbImdlb3NpdGU6Z29vZ2xlLXBsYXkiLCJnZW9zaXRlOmdpdGh1YiIsImdlb3NpdGU6dHdpdGNoLWFkcyIsImdlb3NpdGU6eW91dHViZSIsImdlb3NpdGU6dGVsZWdyYW0iXSwiUHJveHlJcCI6W10sIkRvbWVzdGljRE5TVHlwZSI6IkRvSCIsIkRvbWVzdGljRE5TSXAiOiI3Ny44OC44LjgiLCJEbnNIb3N0cyI6eyJsa2ZsMi5uYWxvZy5ydSI6IjIxMy4yNC42NC4xNzUiLCJsa25wZC5uYWxvZy5ydSI6IjIxMy4yNC42NC4xODEifSwiQmxvY2tTaXRlcyI6WyJnZW9zaXRlOndpbi1zcHkiLCJnZW9zaXRlOnRvcnJlbnQiLCJnZW9zaXRlOmNhdGVnb3J5LWFkcyJdLCJCbG9ja0lwIjpbXSwiTGFzdFVwZGF0ZWQiOjAsIkZha2VEbnMiOmZhbHNlLCJOYW1lIjoiUm9zY29tVlBOIiwiRGlyZWN0SXAiOlsiZ2VvaXA6cHJpdmF0ZSIsImdlb2lwOmRpcmVjdCJdLCJEb21haW5TdHJhdGVneSI6IklQSWZOb25NYXRjaCIsIlJvdXRlT3JkZXIiOiJibG9jay1wcm94eS1kaXJlY3QiLCJVc2VDaHVua0ZpbGVzIjp0cnVlfQ=="
+
+def load_happ_routing():
+    if os.path.exists(ROUTING_FILE):
+        val = read_opt(ROUTING_FILE, 16384)
+        if val.lower() in ("off", "none", "disabled", "0"):
+            return ""
+        return val
+    return DEFAULT_HAPP_ROUTING
 EXTRA_NODES_FILE = os.environ.get("WAGA_SUB_EXTRA") or "/etc/waga-sub/extra_nodes.txt"
 
 
@@ -428,10 +438,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = text.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
-        if "announce" not in headers:
-            ann = read_opt(ANNOUNCE_FILE, 2048)
-            if ann:
-                self.send_header("Announce", "base64:" + base64.b64encode(ann.encode("utf-8")).decode("ascii"))
         self.send_header("Content-Length", str(len(body)))
         self.send_connection()
         self.end_headers()
@@ -521,6 +527,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 v = fix_userinfo(headers[k]) if k == "subscription-userinfo" else headers[k]
                 if v and "\r" not in v and "\n" not in v:
                     self.send_header(k.title(), v)
+        if code == 200 and "announce" not in headers:
+            ann = read_opt(ANNOUNCE_FILE, 2048)
+            if ann:
+                self.send_header("Announce", "base64:" + base64.b64encode(ann.encode("utf-8")).decode("ascii"))
+        if code == 200 and "routing" not in headers:
+            rt = load_happ_routing()
+            if rt and "\r" not in rt and "\n" not in rt:
+                self.send_header("Routing", rt)
+                if "routing-enable" not in headers:
+                    self.send_header("Routing-Enable", "1")
         self.send_header("Content-Length", str(len(body)))
         self.send_connection()
         self.end_headers()
