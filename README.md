@@ -1,7 +1,7 @@
 <div align="center">
 
-<!-- Обложка проекта (положите картинку в папку images/banner.png в репозитории) -->
-<img src="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main/images/banner.png" alt="WAGA · Дядя Вова VPN Banner" width="900" style="border-radius: 12px;" />
+<!-- Обложка проекта (положите картинку в папку images/banner.webp в репозитории) -->
+<img src="https://raw.githubusercontent.com/lvl853137-bot/3X-UI_Waga/main/images/banner.webp" alt="WAGA · Дядя Вова VPN Banner" width="900" style="border-radius: 12px;" />
 
 # 🚀 WAGA · Дядя Вова VPN `v1.4.0`
 
